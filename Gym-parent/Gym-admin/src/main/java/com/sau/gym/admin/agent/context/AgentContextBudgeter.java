@@ -1,122 +1,123 @@
 package com.sau.gym.admin.agent.context;
 
+import com.sau.gym.admin.agent.config.AgentHarnessProperties;
 import com.sau.gym.admin.agent.memory.model.SessionMessage;
 import com.sau.gym.admin.agent.runtime.AgentRunContext;
+import com.sau.gym.admin.agent.service.AgentTraceService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
  * 作者:hfj
  * 功能:上下文预算控制
  * 说明:
- * 1. 使用 TokenEstimator 估算，不是服务端精确计数。
- * 2. 超出预算时按完整轮次删除最早历史，保留系统提示、当前用户输入和待办关键状态。
- * 3. 不会从中间截断 JSON，也不会拆散 tool_calls 与 tool 结果的配对。
+ * 1. 使用 TokenEstimator 估算，明确是估算而非服务端精确计数。
+ * 2. 达到摘要触发阈值时，先对较早的完整轮次做模型摘要（计入辅助预算）；
+ *    摘要成功后一次性提交“新摘要 + 裁剪后的历史”，绝不先删历史再生成摘要。
+ * 3. 摘要失败时降级为完整轮次裁剪，保留当前输入与关键状态。
+ * 4. 不会拆散 tool_calls 与 tool 结果的配对，也不会从中间截断 JSON。
  */
 @Component
 public class AgentContextBudgeter {
 
     private static final Logger log = LoggerFactory.getLogger(AgentContextBudgeter.class);
 
+    private final AgentSessionSummarizer summarizer;
+
+    private final AgentTraceService traceService;
+
+    private final AgentHarnessProperties properties;
+
+    public AgentContextBudgeter(AgentSessionSummarizer summarizer,
+                                AgentTraceService traceService,
+                                AgentHarnessProperties properties) {
+        this.summarizer = summarizer;
+        this.traceService = traceService;
+        this.properties = properties;
+    }
+
     /**
-     * 在每次模型调用前压缩上下文。
+     * 在每次模型调用前控制上下文预算。
      *
-     * @param runContext       运行上下文
-     * @param toolSchemaTokens 工具 Schema 的估算 Token 数
-     * @return 实际估算 Token 数
+     * @param runContext  运行上下文
+     * @param fixedTokens 系统提示 + 摘要 + 工具 Schema 的固定开销估算
+     * @return 当前估算 Token 数
      */
-    public int enforce(AgentRunContext runContext, int toolSchemaTokens) {
+    public int enforce(AgentRunContext runContext, int fixedTokens) {
         List<SessionMessage> messages = runContext.getMessages();
 
         if (messages == null || messages.isEmpty()) {
-            return 0;
+            return fixedTokens;
         }
 
         int budget = runContext.getMaxContextTokens() > 0
                 ? runContext.getMaxContextTokens()
                 : Integer.MAX_VALUE;
 
-        int estimated = estimate(messages) + Math.max(toolSchemaTokens, 0);
+        double triggerRatio = properties.getSummaryTriggerRatio() > 0
+                ? properties.getSummaryTriggerRatio()
+                : 0.75D;
 
-        if (estimated <= budget) {
-            return estimated;
+        int triggerTokens = (int) Math.max(budget * triggerRatio, 1);
+
+        int before = fixedTokens + estimate(messages);
+
+        //低于触发阈值时直接返回，不在每次模型请求前无条件调用摘要模型。
+        if (before <= triggerTokens) {
+            return before;
         }
 
-        //从最早的历史轮次开始删除，直到满足预算或只剩系统消息 + 当前输入。
-        while (estimated > budget) {
+        //1. 对较早的完整轮次尝试摘要。
+        List<SessionMessage> turnsToSummarize = collectSummarizableTurns(messages);
+
+        if (!turnsToSummarize.isEmpty()) {
+            AgentSessionSummarizer.SummarizeResult outcome = summarizer.summarize(
+                    runContext,
+                    runContext.getSummary(),
+                    turnsToSummarize
+            );
+
+            if (outcome.ok) {
+                //先拿到摘要再移除消息，不存在“先删历史再摘要”。
+                messages.removeAll(turnsToSummarize);
+                runContext.setSummary(outcome.summary);
+                runContext.setSummaryVersion(runContext.getSummaryVersion() + 1);
+
+                int after = fixedTokens + estimate(messages);
+
+                traceCompact(before, after, turnsToSummarize.size(),
+                        runContext.getSummaryVersion(), true, null);
+
+                return after;
+            }
+
+            traceCompact(before, before, 0, runContext.getSummaryVersion(), false, outcome.failureReason);
+        }
+
+        //2. 降级：完整轮次裁剪，保留当前输入与关键状态。
+        int total = before;
+
+        while (total > budget) {
             int removed = dropOldestTurn(messages);
 
             if (removed <= 0) {
-                //无法继续安全裁剪时停止，由运行时决定是否继续调用模型。
-                log.warn("[AgentContext] 上下文无法继续裁剪, estimated={}, budget={}", estimated, budget);
+                log.warn("[AgentContext] 上下文无法继续裁剪, estimated={}, budget={}", total, budget);
                 break;
             }
 
-            estimated = estimate(messages) + Math.max(toolSchemaTokens, 0);
+            total = fixedTokens + estimate(messages);
         }
 
-        return estimated;
-    }
-
-    /**
-     * 删除最早的一轮历史。
-     * 一轮历史从一条 user 消息开始，到下一个 user 消息之前结束，
-     * 因此 assistant 的 tool_calls 与对应 tool 结果会一起被删除。
-     *
-     * @return 实际删除的消息条数，0 表示没有可安全删除的历史
-     */
-    private int dropOldestTurn(List<SessionMessage> messages) {
-        if (messages.size() <= 2) {
-            return 0;
+        if (total != before) {
+            traceCompact(before, total, Math.max(before - total, 0),
+                    runContext.getSummaryVersion(), false, "摘要不可用，已降级为完整轮次裁剪");
         }
 
-        //索引 0 固定是系统提示，必须保留。
-        int lastUserIndex = -1;
-
-        for (int i = messages.size() - 1; i >= 1; i--) {
-            if ("user".equals(messages.get(i).getRole())) {
-                lastUserIndex = i;
-                break;
-            }
-        }
-
-        if (lastUserIndex <= 1) {
-            //当前输入之前没有可删除的历史。
-            return 0;
-        }
-
-        //最早的一轮历史从第一条历史 user 消息开始。
-        int turnStart = -1;
-
-        for (int i = 1; i < lastUserIndex; i++) {
-            if ("user".equals(messages.get(i).getRole())) {
-                turnStart = i;
-                break;
-            }
-        }
-
-        if (turnStart < 1 || turnStart == lastUserIndex) {
-            //只剩当前这一轮，没有可安全删除的历史。
-            return 0;
-        }
-
-        //结束边界是下一条 user 消息，保证 tool_calls 与 tool 结果整轮删除。
-        int turnEnd = lastUserIndex;
-
-        for (int i = turnStart + 1; i < lastUserIndex; i++) {
-            if ("user".equals(messages.get(i).getRole())) {
-                turnEnd = i;
-                break;
-            }
-        }
-
-        int removed = turnEnd - turnStart;
-        messages.subList(turnStart, turnEnd).clear();
-
-        return removed;
+        return total;
     }
 
     /**
@@ -148,5 +149,113 @@ public class AgentContextBudgeter {
         }
 
         return total;
+    }
+
+    /**
+     * 划分轮次分组。
+     * 每组从一条 user 消息开始到下一条 user 消息之前；
+     * 开头没有 user 消息的孤儿前缀也算一组，保证 tool_calls 与 tool 结果整组处理。
+     */
+    private List<int[]> turnGroups(List<SessionMessage> messages) {
+        List<Integer> starts = new ArrayList<>();
+
+        for (int i = 0; i < messages.size(); i++) {
+            if ("user".equals(messages.get(i).getRole())) {
+                starts.add(i);
+            }
+        }
+
+        List<int[]> groups = new ArrayList<>();
+
+        if (starts.isEmpty()) {
+            if (!messages.isEmpty()) {
+                groups.add(new int[]{0, messages.size()});
+            }
+            return groups;
+        }
+
+        if (starts.get(0) > 0) {
+            groups.add(new int[]{0, starts.get(0)});
+        }
+
+        for (int s = 0; s < starts.size(); s++) {
+            int end = (s + 1 < starts.size()) ? starts.get(s + 1) : messages.size();
+            groups.add(new int[]{starts.get(s), end});
+        }
+
+        return groups;
+    }
+
+    /**
+     * 收集可摘要的较早完整轮次。
+     * 保留最近 N 组（含当前输入所在的最后一组），更早的组作为摘要候选。
+     */
+    private List<SessionMessage> collectSummarizableTurns(List<SessionMessage> messages) {
+        int keep = properties.getSummaryKeepRecentTurns() > 0
+                ? properties.getSummaryKeepRecentTurns()
+                : 4;
+
+        List<int[]> groups = turnGroups(messages);
+
+        if (groups.size() <= keep) {
+            return List.of();
+        }
+
+        List<SessionMessage> result = new ArrayList<>();
+
+        for (int g = 0; g < groups.size() - keep; g++) {
+            int[] range = groups.get(g);
+            result.addAll(messages.subList(range[0], range[1]));
+        }
+
+        return result;
+    }
+
+    /**
+     * 降级路径：删除最早的一轮历史。
+     *
+     * @return 删除的消息条数，0 表示没有可安全删除的历史
+     */
+    private int dropOldestTurn(List<SessionMessage> messages) {
+        List<int[]> groups = turnGroups(messages);
+
+        if (groups.size() < 2) {
+            return 0;
+        }
+
+        int start = groups.get(0)[0];
+        int end = groups.get(1)[0];
+
+        int removed = end - start;
+        messages.subList(start, end).clear();
+
+        return removed;
+    }
+
+    /**
+     * 写 CONTEXT_COMPACT Trace。
+     */
+    private void traceCompact(int before,
+                              int after,
+                              int removedTurnMessages,
+                              int summaryVersion,
+                              boolean summarized,
+                              String failureReason) {
+        try {
+            traceService.addStep(
+                    "CONTEXT_COMPACT",
+                    summarized ? "历史摘要成功" : "历史摘要降级裁剪",
+                    "beforeEstimateTokens=" + before,
+                    "afterEstimateTokens=" + after
+                            + ", removedMessages=" + removedTurnMessages
+                            + ", summaryVersion=" + summaryVersion
+                            + (failureReason == null ? "" : ", reason=" + failureReason),
+                    "SUCCESS",
+                    failureReason,
+                    0L
+            );
+        } catch (Exception e) {
+            log.warn("[AgentContext] Trace 写入失败: {}", e.getMessage());
+        }
     }
 }

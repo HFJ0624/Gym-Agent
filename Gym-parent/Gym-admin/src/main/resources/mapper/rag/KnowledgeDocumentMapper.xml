@@ -110,10 +110,40 @@
             priority,
             enabled,
             indexed_status AS indexedStatus,
+            is_deleted AS isDeleted,
             create_time AS createTime,
             update_time AS updateTime
         FROM knowledge_document
         WHERE id = #{id}
+    </select>
+
+    <!-- 根据 ID 批量查询权威文档，供检索证据有效性校验使用，避免逐条查询 -->
+    <select id="selectByIds" resultType="com.sau.gym.model.entity.rag.KnowledgeDocument">
+        SELECT
+            id,
+            title,
+            content,
+            knowledge_scope AS knowledgeScope,
+            source_type AS sourceType,
+            venue_id AS venueId,
+            venue_name AS venueName,
+            court_id AS courtId,
+            court_name AS courtName,
+            court_type AS courtType,
+            notice_id AS noticeId,
+            topic,
+            tags,
+            priority,
+            enabled,
+            indexed_status AS indexedStatus,
+            is_deleted AS isDeleted,
+            create_time AS createTime,
+            update_time AS updateTime
+        FROM knowledge_document
+        WHERE id IN
+        <foreach collection="ids" item="id" open="(" separator="," close=")">
+            #{id}
+        </foreach>
     </select>
 
     <!-- 更新知识文档 -->

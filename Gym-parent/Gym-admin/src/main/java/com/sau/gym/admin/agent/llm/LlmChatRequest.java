@@ -60,4 +60,12 @@ public class LlmChatRequest {
      */
     @com.fasterxml.jackson.annotation.JsonIgnore
     private Integer timeoutMs;
+
+    /**
+     * 模型调用用途标识。
+     * 取值参考 ModelCallPurpose：AGENT / KNOWLEDGE_ANSWER / CONTEXT_SUMMARY / ANSWER_REPAIR。
+     * 不参与协议序列化，仅用于预算分类、日志与 Trace，避免出现绕过预算统计的隐藏调用。
+     */
+    @com.fasterxml.jackson.annotation.JsonIgnore
+    private String purpose;
 }

@@ -1,9 +1,7 @@
 package com.sau.gym.admin.rag.config;
 
 
-import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.pgvector.PgVectorEmbeddingStore;
 import dev.langchain4j.data.segment.TextSegment;
@@ -11,8 +9,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import com.sau.gym.admin.rag.embedding.VolcanoMultimodalEmbeddingModel;
-
-import java.time.Duration;
 /**
  * 作者:hfj
  * 功能:RAG相关Bean配置。
@@ -20,42 +16,6 @@ import java.time.Duration;
  */
 @Configuration
 public class RagConfig {
-
-    /**
-     * 聊天模型 base-url。
-     *
-     * 对应配置：
-     * gym.ai.base-url
-     */
-    @Value("${gym.ai.base-url}")
-    private String chatBaseUrl;
-
-    /**
-     * 聊天模型 API Key。
-     *
-     * 对应配置：
-     * gym.ai.api-key
-     */
-    @Value("${gym.ai.api-key}")
-    private String chatApiKey;
-
-    /**
-     * 聊天模型名称。
-     *
-     * 对应配置：
-     * gym.ai.model-name
-     */
-    @Value("${gym.ai.model-name}")
-    private String chatModelName;
-
-    /**
-     * 聊天模型温度。
-     *
-     * 对应配置：
-     * gym.ai.temperature
-     */
-    @Value("${gym.ai.temperature:0.1}")
-    private Double temperature;
 
     /**
      * embedding base-url。
@@ -130,26 +90,11 @@ public class RagConfig {
     private Integer embeddingDimension;
 
     /**
-     * 聊天模型 Bean。
-     *
-     * 作用：
-     * 根据 RAG 检索出来的上下文生成最终回答。
+     * 说明：
+     * RAG 原独立聊天模型 Bean（ragChatModel）已在第二轮移除。
+     * 知识回答统一走第一轮自建 LlmClient（gym.ai.* 配置），
+     * 避免同一回答出现两套模型客户端与两种超时策略。
      */
-    @Bean
-    public ChatModel ragChatModel() {
-        return OpenAiChatModel.builder()
-                // 火山方舟 OpenAI 兼容接口地址
-                .baseUrl(chatBaseUrl)
-                // 聊天模型 API Key
-                .apiKey(chatApiKey)
-                // 聊天模型名称
-                .modelName(chatModelName)
-                // RAG 场景建议温度低一点，减少胡编
-                .temperature(temperature)
-                // 超时时间，避免接口长时间无响应
-                .timeout(Duration.ofSeconds(60))
-                .build();
-    }
 
     /**
      * Embedding 模型。

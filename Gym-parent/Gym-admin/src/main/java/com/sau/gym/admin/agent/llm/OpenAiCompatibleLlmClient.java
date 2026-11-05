@@ -128,7 +128,8 @@ public class OpenAiCompatibleLlmClient implements LlmClient {
         int status = httpResponse.statusCode();
 
         //只记录必要元信息，不打印请求头与请求体，避免凭据和用户隐私落日志。
-        log.info("[LlmClient] model={}, messages={}, tools={}, status={}, cost={}ms",
+        log.info("[LlmClient] purpose={}, model={}, messages={}, tools={}, status={}, cost={}ms",
+                request.getPurpose() == null ? "UNKNOWN" : request.getPurpose(),
                 request.getModel(),
                 request.getMessages() == null ? 0 : request.getMessages().size(),
                 request.getTools() == null ? 0 : request.getTools().size(),

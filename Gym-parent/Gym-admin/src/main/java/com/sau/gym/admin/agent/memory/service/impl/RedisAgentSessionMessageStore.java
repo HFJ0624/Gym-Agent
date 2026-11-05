@@ -2,6 +2,7 @@ package com.sau.gym.admin.agent.memory.service.impl;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sau.gym.admin.agent.memory.model.SessionHistory;
 import com.sau.gym.admin.agent.memory.model.SessionMessage;
 import com.sau.gym.admin.agent.memory.service.AgentSessionMessageStore;
 import org.slf4j.Logger;
@@ -12,7 +13,9 @@ import org.springframework.util.StringUtils;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 作者:hfj
@@ -20,7 +23,8 @@ import java.util.List;
  * 说明:
  * 1. key 由 userId + sessionId 共同构成，保证同一用户不同会话隔离。
  * 2. 未登录用户使用 guest 占位，不会与登录用户串数据。
- * 3. 只保留最近若干条消息，避免无限增长。
+ * 3. 存储格式为 SessionHistory 快照（摘要 + 消息），兼容第一轮纯数组格式。
+ * 4. 只保留最近若干条消息，避免无限增长。
  */
 @Service
 public class RedisAgentSessionMessageStore implements AgentSessionMessageStore {
@@ -54,49 +58,74 @@ public class RedisAgentSessionMessageStore implements AgentSessionMessageStore {
     }
 
     @Override
-    public List<SessionMessage> load(Long userId, String sessionId) {
+    public SessionHistory loadHistory(Long userId, String sessionId) {
+        SessionHistory history = new SessionHistory();
+        history.setMessages(new ArrayList<>());
+
         try {
             String json = stringRedisTemplate.opsForValue().get(buildKey(userId, sessionId));
 
             if (!StringUtils.hasText(json)) {
-                return new ArrayList<>();
+                return history;
             }
 
-            List<SessionMessage> messages = objectMapper.readValue(
-                    json,
-                    new TypeReference<List<SessionMessage>>() {
-                    }
-            );
+            String trimmed = json.trim();
 
-            return messages == null ? new ArrayList<>() : messages;
+            //兼容第一轮的纯消息数组格式。
+            if (trimmed.startsWith("[")) {
+                List<SessionMessage> messages = objectMapper.readValue(
+                        trimmed,
+                        new TypeReference<List<SessionMessage>>() {
+                        }
+                );
+                history.setMessages(messages == null ? new ArrayList<>() : messages);
+                return history;
+            }
+
+            SessionHistory stored = objectMapper.readValue(trimmed, SessionHistory.class);
+
+            if (stored == null) {
+                return history;
+            }
+
+            history.setSummary(stored.getSummary());
+            history.setSummaryVersion(stored.getSummaryVersion());
+            history.setMessages(stored.getMessages() == null ? new ArrayList<>() : stored.getMessages());
+
+            return history;
         } catch (Exception e) {
             //历史读取失败按空历史处理，不影响本轮对话，但要留下可观察日志。
             log.warn("[AgentSession] 读取会话历史失败, sessionId={}, reason={}", sessionId, e.getMessage());
-            return new ArrayList<>();
+            return history;
         }
     }
 
     @Override
-    public boolean append(Long userId, String sessionId, List<SessionMessage> messages) {
-        if (messages == null || messages.isEmpty()) {
+    public boolean saveHistory(Long userId, String sessionId, SessionHistory history) {
+        if (history == null) {
             return true;
         }
 
         try {
             String key = buildKey(userId, sessionId);
 
-            //先合并历史再整体写回，保证顺序稳定且不会出现半截工具配对。
-            List<SessionMessage> all = load(userId, sessionId);
-            all.addAll(messages);
+            List<SessionMessage> messages = history.getMessages() == null
+                    ? new ArrayList<>()
+                    : new ArrayList<>(history.getMessages());
 
-            while (all.size() > MAX_MESSAGE_COUNT) {
-                all.remove(0);
+            while (messages.size() > MAX_MESSAGE_COUNT) {
+                messages.remove(0);
             }
 
             //裁剪后仍需保证 tool 消息能找到对应的 assistant tool_calls。
-            all = dropOrphanToolMessages(all);
+            messages = dropOrphanToolMessages(messages);
 
-            String json = objectMapper.writeValueAsString(all);
+            SessionHistory snapshot = new SessionHistory();
+            snapshot.setSummary(history.getSummary());
+            snapshot.setSummaryVersion(history.getSummaryVersion());
+            snapshot.setMessages(messages);
+
+            String json = objectMapper.writeValueAsString(snapshot);
             stringRedisTemplate.opsForValue().set(key, json, TTL);
 
             return true;
@@ -123,7 +152,7 @@ public class RedisAgentSessionMessageStore implements AgentSessionMessageStore {
     private List<SessionMessage> dropOrphanToolMessages(List<SessionMessage> messages) {
         List<SessionMessage> result = new ArrayList<>(messages.size());
 
-        java.util.Set<String> knownCallIds = new java.util.HashSet<>();
+        Set<String> knownCallIds = new HashSet<>();
 
         for (SessionMessage message : messages) {
             if (message == null || !StringUtils.hasText(message.getRole())) {

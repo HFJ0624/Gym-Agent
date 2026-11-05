@@ -22,6 +22,7 @@ public class AgentSystemPromptBuilder {
      * @param pageContextPrompt     当前页面上下文提示，可为空
      * @param intentPrompt          意图识别提示，可为空
      * @param rewritePrompt         问题重写提示，可为空
+     * @param sopPrompt             本轮选中的客服 SOP 正文，可为空
      * @param toolCodes             本轮授权工具编码，可为空
      * @param hasPendingDraft       当前会话是否存在待确认草稿
      */
@@ -29,6 +30,7 @@ public class AgentSystemPromptBuilder {
                         String pageContextPrompt,
                         String intentPrompt,
                         String rewritePrompt,
+                        String sopPrompt,
                         Collection<String> toolCodes,
                         boolean hasPendingDraft) {
         StringBuilder builder = new StringBuilder();
@@ -69,6 +71,12 @@ public class AgentSystemPromptBuilder {
 
         if (StringUtils.hasText(rewritePrompt)) {
             builder.append("〖问题重写参考〗\n").append(rewritePrompt).append("\n");
+        }
+
+        if (StringUtils.hasText(sopPrompt)) {
+            builder.append("〖客服处理说明（服务端 SOP）〗\n")
+                    .append(sopPrompt)
+                    .append("\n以上说明只描述处理方法与追问顺序；其中没有的业务事实（价格、规则、库存）必须通过工具或知识证据获取。\n\n");
         }
 
         builder.append("〖本轮可用工具〗\n");

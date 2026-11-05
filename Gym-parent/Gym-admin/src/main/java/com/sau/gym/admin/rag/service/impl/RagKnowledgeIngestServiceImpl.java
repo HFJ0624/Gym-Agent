@@ -2,6 +2,7 @@ package com.sau.gym.admin.rag.service.impl;
 
 import com.sau.gym.admin.mapper.KnowledgeDocumentMapper;
 import com.sau.gym.admin.rag.chunk.SimpleTextChunker;
+import com.sau.gym.admin.rag.retrieval.RagIndexMetadataFactory;
 import com.sau.gym.admin.rag.service.RagKnowledgeIngestService;
 import com.sau.gym.model.dto.rag.KnowledgeDocumentSaveDto;
 import com.sau.gym.model.entity.rag.KnowledgeDocument;
@@ -20,7 +21,6 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.Statement;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -187,38 +187,11 @@ public class RagKnowledgeIngestServiceImpl implements RagKnowledgeIngestService 
             String chunkText = chunks.get(i);
 
             // 3. 构造 metadata
-            // metadata 的作用：
-            // 1. 后续回答时返回引用来源
-            // 2. 后续可以根据 venueId/courtId 做范围过滤
-            Map<String, Object> metadataMap = new HashMap<>();
-
-            // 知识文档基础信息
-            metadataMap.put("docId", value(document.getId()));
-            metadataMap.put("title", value(document.getTitle()));
-
-            // 知识范围和来源类型
-            metadataMap.put("knowledgeScope", value(document.getKnowledgeScope()));
-            metadataMap.put("sourceType", value(document.getSourceType()));
-
-            // 场馆信息
-            metadataMap.put("venueId", value(document.getVenueId()));
-            metadataMap.put("venueName", value(document.getVenueName()));
-
-            // 场地信息
-            metadataMap.put("courtId", value(document.getCourtId()));
-            metadataMap.put("courtName", value(document.getCourtName()));
-            metadataMap.put("courtType", value(document.getCourtType()));
-
-            // 公告信息
-            metadataMap.put("noticeId", value(document.getNoticeId()));
-
-            // 主题、标签、优先级
-            metadataMap.put("topic", value(document.getTopic()));
-            metadataMap.put("tags", value(document.getTags()));
-            metadataMap.put("priority", value(document.getPriority()));
-
-            // 当前 chunk 下标
-            metadataMap.put("chunkIndex", String.valueOf(i));
+            // 统一使用 RagIndexMetadataFactory，保证与增量重建入口的
+            // 字段格式和内容指纹（contentHash）完全一致，
+            // 检索阶段据此校验证据的内容版本。
+            Map<String, Object> metadataMap =
+                    RagIndexMetadataFactory.buildMetadata(document, i);
 
             Metadata metadata = Metadata.from(metadataMap);
 
@@ -261,14 +234,5 @@ public class RagKnowledgeIngestServiceImpl implements RagKnowledgeIngestService 
             // 这里不能抛异常，否则会影响知识重建流程。
             System.out.println("[RAG] 清空 pgvector 表失败，可能是表暂不存在：" + e.getMessage());
         }
-    }
-
-    /**
-     * metadata 中不要放 null，统一转成空字符串。
-     *
-     * 这样后续从 metadata 取值时更稳定。
-     */
-    private String value(Object value) {
-        return value == null ? "" : String.valueOf(value);
     }
 }

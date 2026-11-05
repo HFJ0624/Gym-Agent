@@ -1,6 +1,7 @@
 package com.sau.gym.admin.rag.service.impl;
 
 import com.sau.gym.admin.mapper.KnowledgeDocumentMapper;
+import com.sau.gym.admin.rag.retrieval.RagIndexMetadataFactory;
 import com.sau.gym.admin.rag.service.RagIncrementalIndexService;
 import com.sau.gym.admin.rag.service.RagVectorCleanService;
 import com.sau.gym.model.entity.rag.KnowledgeDocument;
@@ -167,44 +168,13 @@ public class RagIncrementalIndexServiceImpl implements RagIncrementalIndexServic
 
     /**
      * 构造 metadata。
-     * docId 是必须字段。
-     * 后续单条删除旧向量就是靠 metadata.docId。
+     * docId 是必须字段，单条删除旧向量依赖 metadata.docId。
+     * 统一委托 RagIndexMetadataFactory，保证与全量入库入口的
+     * 字段格式、contentHash 内容指纹完全一致，
+     * 避免普通入库与增量重建产生不同格式的元数据。
      */
     private Metadata buildMetadata(KnowledgeDocument doc, int chunkIndex) {
-        Metadata metadata = new Metadata();
-
-        metadata.put("docId", String.valueOf(doc.getId()));
-        metadata.put("chunkIndex", String.valueOf(chunkIndex));
-
-        if (StringUtils.hasText(doc.getTitle())) {
-            metadata.put("title", doc.getTitle());
-        }
-
-        if (doc.getKnowledgeScope() != null) {
-            metadata.put("knowledgeScope", String.valueOf(doc.getKnowledgeScope()));
-        }
-
-        if (StringUtils.hasText(doc.getTopic())) {
-            metadata.put("topic", doc.getTopic());
-        }
-
-        if (doc.getVenueId() != null) {
-            metadata.put("venueId", String.valueOf(doc.getVenueId()));
-        }
-
-        if (StringUtils.hasText(doc.getVenueName())) {
-            metadata.put("venueName", doc.getVenueName());
-        }
-
-        if (doc.getCourtId() != null) {
-            metadata.put("courtId", String.valueOf(doc.getCourtId()));
-        }
-
-        if (StringUtils.hasText(doc.getCourtName())) {
-            metadata.put("courtName", doc.getCourtName());
-        }
-
-        return metadata;
+        return Metadata.from(RagIndexMetadataFactory.buildMetadata(doc, chunkIndex));
     }
 
     /***

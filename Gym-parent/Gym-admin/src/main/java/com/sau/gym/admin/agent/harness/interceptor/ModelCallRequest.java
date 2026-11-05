@@ -45,6 +45,12 @@ public class ModelCallRequest {
     private Integer timeoutMs;
 
     /**
+     * 模型调用用途。
+     * AGENT 计入主循环轮数；CONTEXT_SUMMARY / ANSWER_REPAIR 等辅助用途计入辅助调用预算。
+     */
+    private com.sau.gym.admin.agent.harness.interceptor.ModelCallPurpose purpose;
+
+    /**
      * 拦截器可写入的响应，便于链上后续组件读取。
      */
     private LlmChatResponse response;
@@ -61,6 +67,7 @@ public class ModelCallRequest {
         chatRequest.setTools(tools == null || tools.isEmpty() ? null : tools);
         chatRequest.setToolChoice(tools == null || tools.isEmpty() ? null : "auto");
         chatRequest.setTimeoutMs(timeoutMs);
+        chatRequest.setPurpose(purpose == null ? null : purpose.name());
 
         return chatRequest;
     }

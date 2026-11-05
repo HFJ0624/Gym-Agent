@@ -153,9 +153,42 @@
               </template>
             </div>
 
-            <!-- AI 回复中的确认按钮 -->
+            <!-- 参考来源（v2 由后端校验后下发） -->
             <div
-              v-if="msg.role === 'ai' && msg.actions && !msg.actionUsed"
+              v-if="msg.role === 'ai' && msg.sources && msg.sources.length"
+              class="source-box"
+            >
+              <div class="source-title">参考来源</div>
+              <div
+                v-for="s in msg.sources"
+                :key="s.label"
+                class="source-item"
+              >
+                [{{ s.label }}] {{ s.title }}（{{ s.scopeName }}{{ s.venueName ? '，' + s.venueName : '' }}）
+              </div>
+            </div>
+
+            <!-- AI 回复中的操作按钮：v2 由后端下发 -->
+            <div
+              v-if="msg.role === 'ai' && msg.actionButtons && msg.actionButtons.length && !msg.actionUsed"
+              class="action-box"
+            >
+              <el-button
+                v-for="(action, index) in msg.actionButtons"
+                :key="index"
+                :type="action.type === 'confirm' ? 'primary' : 'default'"
+                size="small"
+                :loading="msg.actionLoading && action.type === 'confirm'"
+                :disabled="msg.actionLoading && action.type !== 'confirm'"
+                @click="handleActionButton(msg, action)"
+              >
+                {{ action.label }}
+              </el-button>
+            </div>
+
+            <!-- 旧版兼容：单一确认/取消按钮 -->
+            <div
+              v-else-if="msg.role === 'ai' && msg.actions && !msg.actionUsed && !msg.actionButtons"
               class="action-box"
             >
               <el-button
@@ -385,11 +418,10 @@ const sendMessage = async text => {
 
   try {
     const { data } = await axios.post(
-      'http://localhost:9601/front/agent/chat',
+      'http://localhost:9601/front/agent/chat/v2',
 
       /**
-       * 后端 @RequestBody AgentChatDto 接收这里：
-       * message / venueId / courtId。
+       * v2 请求体与 v1 一致：message / venueId / courtId / sessionId。
        */
       {
         message: msg,
@@ -428,19 +460,44 @@ const sendMessage = async text => {
         content: data.message || '请求未成功，请稍后再试。',
         draft: null,
         actions: null,
+        actionButtons: null,
         actionUsed: false,
-        actionLoading: false
+        actionLoading: false,
+        sources: []
       })
 
       return
     }
 
     /**
-     * 新版解析逻辑：
-     * 1. 优先解析后端 AgentToolExecuteResult JSON
-     * 2. 如果不是 JSON，再按旧版纯文本解析
-     *
-     * 这样可以解决你截图里“JSON 和字段串在一起展示”的问题。
+     * v2 结构化回复：正文、来源、卡片、动作全部由后端组装，
+     * 前端不再从自然语言中猜测动作或解析嵌套 JSON。
+     */
+    const payload = data && data.data && typeof data.data === 'object' && data.data.status
+      ? data.data
+      : null
+
+    if (payload) {
+      const draft = payload.cards && payload.cards.length
+        ? buildDraftFromCard(payload.cards[0])
+        : null
+
+      messages.value.push({
+        role: 'ai',
+        content: payload.message || '',
+        draft,
+        actions: null,
+        actionButtons: payload.actions || [],
+        actionUsed: false,
+        actionLoading: false,
+        sources: payload.sources || []
+      })
+
+      return
+    }
+
+    /**
+     * 旧版解析逻辑兜底（v1 纯文本或 JSON 字符串）。
      */
     const parsedReply = parseAgentReply(data)
 
@@ -449,8 +506,10 @@ const sendMessage = async text => {
       content: parsedReply.replyText,
       draft: parsedReply.draft,
       actions: parsedReply.actions,
+      actionButtons: null,
       actionUsed: false,
-      actionLoading: false
+      actionLoading: false,
+      sources: []
     })
   } catch (e) {
     ElMessage.error('连接 AI 服务失败')
@@ -461,12 +520,90 @@ const sendMessage = async text => {
       content: 'AI服务暂时不可用，请稍后再试。',
       draft: null,
       actions: null,
+      actionButtons: null,
       actionUsed: false,
-      actionLoading: false
+      actionLoading: false,
+      sources: []
     })
   } finally {
     sending.value = false
     scrollToBottom()
+  }
+}
+
+/**
+ * 把后端 v2 卡片转换成草稿卡片数据。
+ * 卡片与确认信息全部来自后端真实草稿。
+ */
+function buildDraftFromCard(card) {
+  const draftData = card.data || {}
+
+  if (card.type === 'BOOKING') {
+    return {
+      type: 'BOOKING',
+      title: '预约草稿',
+      venueName: draftData.venueName || '-',
+      courtName: draftData.courtName || '-',
+      courtType: draftData.courtType || '-',
+      date: draftData.date || draftData.bookingDate || '-',
+      startTime: draftData.startTime || '-',
+      endTime: draftData.endTime || '-',
+      hourPrice: draftData.hourPrice || draftData.hoursPrice || '-',
+      totalPrice: draftData.totalPrice || '-',
+      confirmToken: card.confirmToken
+    }
+  }
+
+  if (card.type === 'SHOPPING') {
+    const quantity = Number(draftData.quantity) || 0
+    const price = Number(draftData.price) || 0
+
+    return {
+      type: 'SHOPPING',
+      title: '商品下单草稿',
+      goodsName: draftData.goodsName || draftData.productName || '-',
+      quantity: draftData.quantity || '-',
+      price: draftData.price || '-',
+      totalPrice: draftData.totalPrice || (quantity && price ? (quantity * price).toFixed(2) : '-'),
+      confirmToken: card.confirmToken
+    }
+  }
+
+  if (card.type === 'CANCEL_BOOKING') {
+    return {
+      type: 'CANCEL_BOOKING',
+      title: '取消预约草稿',
+      bookingId: draftData.bookingId || '-',
+      venueName: draftData.venueName || '-',
+      courtName: draftData.courtName || '-',
+      bookingDate: draftData.bookingDate || draftData.date || '-',
+      startTime: draftData.startTime || '-',
+      endTime: draftData.endTime || '-',
+      totalPrice: draftData.totalPrice || '-',
+      confirmToken: card.confirmToken
+    }
+  }
+
+  return null
+}
+
+/**
+ * 点击后端下发的操作按钮。
+ * 命令文本由后端生成（例如“确认预约 123456”），前端只负责发送。
+ */
+const handleActionButton = async (msg, action) => {
+  if (!action || msg.actionUsed) {
+    return
+  }
+
+  msg.actionLoading = true
+
+  try {
+    msg.actionUsed = true
+
+    await sendMessage(action.command)
+  } finally {
+    msg.actionLoading = false
   }
 }
 
@@ -1496,6 +1633,36 @@ function scrollToBottom() {
   margin-top: 8px;
   color: #909399;
   font-size: 12px;
+}
+
+/**
+ * 参考来源展示。
+ */
+.source-box {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: #f8f9fb;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+/**
+ * 来源标题。
+ */
+.source-title {
+  color: #909399;
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+/**
+ * 单条来源。
+ */
+.source-item {
+  color: #606266;
+  line-height: 1.6;
+  word-break: break-all;
 }
 
 .chat-footer {

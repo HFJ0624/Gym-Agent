@@ -55,7 +55,7 @@ public class AgentServiceImpl implements AgentService {
     }
 
     @Override
-    public String chat(Long userId, AgentChatDto agentChatDto) {
+    public AgentRunResult chat(Long userId, AgentChatDto agentChatDto) {
         if (agentChatDto == null || !StringUtils.hasText(agentChatDto.getMessage())) {
             throw new RuntimeException("消息不能为空");
         }
@@ -93,7 +93,10 @@ public class AgentServiceImpl implements AgentService {
 
             finishTrace(runId, result, reply, System.currentTimeMillis() - start);
 
-            return reply;
+            result.setSessionId(sessionId);
+            result.setRunId(runId);
+
+            return result;
 
         } catch (Exception e) {
             log.error("[AgentService] 处理失败, sessionId={}", sessionId, e);
@@ -114,7 +117,12 @@ public class AgentServiceImpl implements AgentService {
                 log.warn("[AgentService] Trace 收尾失败: {}", traceException.getMessage());
             }
 
-            return reply;
+            AgentRunResult failedResult = AgentRunResult.failed(reply, "AGENT_SERVICE_ERROR");
+            failedResult.setSessionId(sessionId);
+            failedResult.setRunId(runId);
+            failedResult.setReplyText(reply);
+
+            return failedResult;
 
         } finally {
             AgentTraceContext.clear();

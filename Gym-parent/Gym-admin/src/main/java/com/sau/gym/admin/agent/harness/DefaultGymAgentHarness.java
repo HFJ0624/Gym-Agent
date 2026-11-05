@@ -7,6 +7,7 @@ import com.sau.gym.admin.agent.intent.GymIntentRouter;
 import com.sau.gym.admin.agent.intent.IntentRouteRequest;
 import com.sau.gym.admin.agent.intent.IntentRouteResult;
 import com.sau.gym.admin.agent.memory.model.AgentBusinessContext;
+import com.sau.gym.admin.agent.memory.model.SessionHistory;
 import com.sau.gym.admin.agent.memory.model.SessionMessage;
 import com.sau.gym.admin.agent.memory.service.AgentSessionMessageStore;
 import com.sau.gym.admin.agent.rewrite.QuestionRewriteRequest;
@@ -20,8 +21,11 @@ import com.sau.gym.admin.agent.service.AgentContextEnhanceService;
 import com.sau.gym.admin.agent.service.AgentDirectRouteService;
 import com.sau.gym.admin.agent.service.AgentSafetyService;
 import com.sau.gym.admin.agent.service.AgentTraceService;
+import com.sau.gym.admin.agent.sop.AgentSopCatalog;
+import com.sau.gym.admin.agent.sop.SopDefinition;
 import com.sau.gym.admin.agent.store.AgentDraftStore;
 import com.sau.gym.admin.agent.store.AgentSessionLockService;
+import com.sau.gym.admin.agent.store.PendingDraft;
 import com.sau.gym.admin.agent.tool.AgentToolSelector;
 import com.sau.gym.admin.agent.tool.executor.AgentToolExecuteResult;
 import com.sau.gym.admin.agent.util.AgentSessionIdUtil;
@@ -29,7 +33,11 @@ import com.sau.gym.admin.agent.workflow.AgentConfirmationWorkflow;
 import com.sau.gym.admin.agent.workflow.AgentWorkflowRouter;
 import com.sau.gym.admin.agent.workflow.WorkflowDecision;
 import com.sau.gym.admin.agent.workflow.WorkflowType;
+import com.sau.gym.admin.enums.PendingDraftType;
 import com.sau.gym.model.dto.agent.AgentChatDto;
+import com.sau.gym.model.vo.agent.AgentSourceVO;
+import com.sau.gym.admin.rag.retrieval.EvidenceRegistry;
+import com.sau.gym.admin.rag.retrieval.KnowledgeEvidence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -37,18 +45,20 @@ import org.springframework.util.StringUtils;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 作者:hfj
  * 功能:Agent Harness 默认实现
  * 职责:
- * 1. 会话串行控制与历史加载。
+ * 1. 会话串行控制与历史快照加载（消息 + 摘要）。
  * 2. 输入安全检查。
  * 3. 业务上下文准备、意图识别、问题重写。
- * 4. 选择确认/取消/追问/直达/ReAct 流程。
- * 5. 统一提交会话消息并结束本轮。
+ * 4. 选择确认/取消/追问/直达/ReAct 流程；ReAct 场景按需加载服务端 SOP。
+ * 5. 统一提交会话快照并组装结构化回复（来源/卡片/动作）。
  */
 @Component
 public class DefaultGymAgentHarness implements GymAgentHarness {
@@ -85,6 +95,8 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
 
     private final AgentDraftStore draftStore;
 
+    private final AgentSopCatalog sopCatalog;
+
     private final ObjectMapper objectMapper;
 
     public DefaultGymAgentHarness(AgentHarnessProperties properties,
@@ -102,6 +114,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                                   ReActRuntime reActRuntime,
                                   AgentTraceService traceService,
                                   AgentDraftStore draftStore,
+                                  AgentSopCatalog sopCatalog,
                                   ObjectMapper objectMapper) {
         this.properties = properties;
         this.messageStore = messageStore;
@@ -118,7 +131,17 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
         this.reActRuntime = reActRuntime;
         this.traceService = traceService;
         this.draftStore = draftStore;
+        this.sopCatalog = sopCatalog;
         this.objectMapper = objectMapper;
+    }
+
+    /**
+     * 单次请求的会话载体。
+     * 保存历史快照与 ReAct 上下文，供结束阶段统一提交。
+     */
+    private static class RunSession {
+        SessionHistory snapshot;
+        AgentRunContext reactContext;
     }
 
     @Override
@@ -141,43 +164,49 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
             return AgentRunResult.failed("当前会话正在处理上一条消息，请稍后再试。", "SESSION_BUSY");
         }
 
+        RunSession session = new RunSession();
+
         try {
             trace("HARNESS_START", "开始处理本轮请求",
                     "sessionId=" + sessionId + ", runId=" + runId, null, "SUCCESS", null, 0L);
 
-            //1. 输入安全检查。
+            //1. 加载会话历史快照（消息 + 摘要）。
+            session.snapshot = messageStore.loadHistory(userId, sessionId);
+
+            //2. 输入安全检查。
             AgentSafetyCheckResult safetyResult = safetyService.checkUserMessage(userId, message);
 
             if (!safetyResult.isAllowed()) {
                 AgentRunResult result = AgentRunResult.completed(safetyResult.getReason());
                 trace("SAFETY_CHECK", "用户输入安全检查未通过", message,
                         result.getReplyText(), "FAILED", safetyResult.getReason(), 0L);
-                return finish(result, request, sessionId);
+                return finish(result, request, sessionId, session);
             }
 
-            //2. 业务上下文准备。
+            //3. 业务上下文准备。
             AgentBusinessContext businessContext = contextEnhanceService.prepareBeforeAgent(
                     userId, sessionId, message, request.getChatDto()
             );
 
-            //3. 意图识别与问题重写，属于辅助信息，失败不应阻断主流程。
+            //4. 意图识别与问题重写，属于辅助信息，失败不应阻断主流程。
             IntentRouteResult intentResult = routeIntent(userId, message, businessContext, request.getChatDto());
             QuestionRewriteResult rewriteResult = rewrite(userId, message, intentResult, businessContext,
                     request.getChatDto());
 
-            //4. 流程选择。
+            //5. 流程选择。
             WorkflowDecision decision = workflowRouter.decide(message, intentResult);
 
             trace("WORKFLOW_SELECT", "选择流程: " + decision.getType(),
                     "sessionId=" + sessionId + ", runId=" + runId + ", reason=" + decision.getReason(),
                     null, "SUCCESS", null, 0L);
 
-            AgentRunResult result = dispatch(decision, request, sessionId, businessContext, intentResult, rewriteResult);
+            AgentRunResult result = dispatch(decision, request, sessionId, businessContext,
+                    intentResult, rewriteResult, session);
 
-            //5. 草稿生成后把准确槽位回写业务上下文。
+            //6. 草稿生成后把准确槽位回写业务上下文。
             refreshContext(userId, sessionId);
 
-            return finish(result, request, sessionId);
+            return finish(result, request, sessionId, session);
 
         } catch (Exception e) {
             //不向用户暴露堆栈，只记录可观察信息。
@@ -189,7 +218,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
             AgentRunResult result = AgentRunResult.failed("AI 服务暂时不可用，请稍后再试。", "HARNESS_ERROR");
             result.setNewMessages(buildSimpleMessages(message, result.getReplyText()));
 
-            commitQuietly(userId, sessionId, result);
+            commitQuietly(userId, sessionId, result, session);
             return result;
 
         } finally {
@@ -205,7 +234,8 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                                     String sessionId,
                                     AgentBusinessContext businessContext,
                                     IntentRouteResult intentResult,
-                                    QuestionRewriteResult rewriteResult) {
+                                    QuestionRewriteResult rewriteResult,
+                                    RunSession session) {
 
         Long userId = request.getUserId();
         String message = request.getMessage() == null ? "" : request.getMessage().trim();
@@ -227,9 +257,10 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                 );
             }
 
-            case DIRECT_ROUTE -> runDirectRoute(request, sessionId, businessContext, message, intentResult, rewriteResult);
+            case DIRECT_ROUTE -> runDirectRoute(request, sessionId, businessContext, message,
+                    intentResult, rewriteResult, session);
 
-            case REACT -> runReact(request, sessionId, businessContext, intentResult, rewriteResult);
+            case REACT -> runReact(request, sessionId, businessContext, intentResult, rewriteResult, session);
         };
     }
 
@@ -241,7 +272,8 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                                           AgentBusinessContext businessContext,
                                           String message,
                                           IntentRouteResult intentResult,
-                                          QuestionRewriteResult rewriteResult) {
+                                          QuestionRewriteResult rewriteResult,
+                                          RunSession session) {
 
         Long userId = request.getUserId();
         AgentChatDto dto = request.getChatDto();
@@ -254,7 +286,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
         );
 
         if (toolResult == null) {
-            return runReact(request, sessionId, businessContext, intentResult, rewriteResult);
+            return runReact(request, sessionId, businessContext, intentResult, rewriteResult, session);
         }
 
         trace("DIRECT_ROUTE", "命中直达路由",
@@ -269,12 +301,14 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
 
     /**
      * ReAct 路径。
+     * 按场景加载服务端 SOP，并与实际授权工具求交集。
      */
     private AgentRunResult runReact(AgentHarnessRequest request,
                                     String sessionId,
                                     AgentBusinessContext businessContext,
                                     IntentRouteResult intentResult,
-                                    QuestionRewriteResult rewriteResult) {
+                                    QuestionRewriteResult rewriteResult,
+                                    RunSession session) {
 
         Long userId = request.getUserId();
         String message = request.getMessage() == null ? "" : request.getMessage().trim();
@@ -284,8 +318,44 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                 message
         );
 
+        //按需加载 SOP：allowedTools 与 SOP 建议工具求交集，不能通过 SOP 扩大权限。
+        String sopPrompt = null;
+        String intentName = intentResult == null || intentResult.getIntent() == null
+                ? null
+                : intentResult.getIntent().name();
+
+        SopDefinition sop = sopCatalog.select(intentName, hasPendingDraft(userId, sessionId));
+
+        if (sop != null) {
+            if (sop.getAllowedTools() != null && !sop.getAllowedTools().isEmpty()) {
+                allowedTools.retainAll(sop.getAllowedTools());
+            }
+
+            String body = sopCatalog.loadBody(sop);
+
+            if (StringUtils.hasText(body)) {
+                sopPrompt = "SOP: " + sop.getName() + " v" + sop.getVersion() + "\n" + body;
+            }
+        }
+
+        trace("SOP_SELECT", "场景 SOP 选择",
+                "intent=" + intentName,
+                (sop == null ? "none" : sop.getName() + " v" + sop.getVersion())
+                        + ", tools=" + allowedTools,
+                "SUCCESS", null, 0L);
+
         trace("TOOLS_ALLOWED", "本轮授权工具",
                 "sessionId=" + sessionId, String.join(",", allowedTools), "SUCCESS", null, 0L);
+
+        String systemPrompt = promptBuilder.build(
+                contextEnhanceService.buildContextPrompt(businessContext),
+                buildPagePrompt(request.getChatDto(), businessContext),
+                intentResult == null ? null : intentResult.getRoutePrompt(),
+                rewriteResult == null ? null : rewriteResult.getRewritePrompt(),
+                sopPrompt,
+                allowedTools,
+                hasPendingDraft(userId, sessionId)
+        );
 
         AgentRunContext runContext = AgentRunContext.create(
                 properties,
@@ -297,22 +367,23 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                 allowedTools
         );
 
-        //系统提示只组装一次，历史消息随后拼接，当前输入由运行时补入。
-        String systemPrompt = promptBuilder.build(
-                contextEnhanceService.buildContextPrompt(businessContext),
-                buildPagePrompt(request.getChatDto(), businessContext),
-                intentResult == null ? null : intentResult.getRoutePrompt(),
-                rewriteResult == null ? null : rewriteResult.getRewritePrompt(),
-                allowedTools,
-                hasPendingDraft(userId, sessionId)
-        );
+        //系统提示与摘要不持久化在 messages 中，由运行时在每次请求时拼接。
+        runContext.setSystemPrompt(systemPrompt);
+        runContext.setSummary(session.snapshot == null ? null : session.snapshot.getSummary());
+        runContext.setSummaryVersion(session.snapshot == null ? 0 : session.snapshot.getSummaryVersion());
+        runContext.setEvidenceRegistry(new EvidenceRegistry());
+        runContext.setMessages(new ArrayList<>(session.snapshot == null
+                ? List.of()
+                : session.snapshot.getMessages()));
 
-        List<SessionMessage> messages = new ArrayList<>();
-        messages.add(SessionMessage.system(systemPrompt));
-        messages.addAll(messageStore.load(userId, sessionId));
-        runContext.setMessages(messages);
+        session.reactContext = runContext;
 
-        return reActRuntime.run(runContext);
+        AgentRunResult result = reActRuntime.run(runContext);
+
+        //来源展示：只有回答实际引用并通过校验的证据才进入 sources。
+        fillSources(result, runContext.getEvidenceRegistry());
+
+        return result;
     }
 
     /**
@@ -340,9 +411,40 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
     }
 
     /**
-     * 结束本轮:提交会话消息、写最终 Trace。
+     * 填充回答来源。
      */
-    private AgentRunResult finish(AgentRunResult result, AgentHarnessRequest request, String sessionId) {
+    private void fillSources(AgentRunResult result, EvidenceRegistry registry) {
+        if (registry == null) {
+            return;
+        }
+
+        for (KnowledgeEvidence evidence : registry.usedEvidences()) {
+            AgentSourceVO source = new AgentSourceVO();
+            source.setLabel(evidence.getCitationLabel());
+            source.setEvidenceId(evidence.getEvidenceId());
+            source.setDocId(evidence.getDocId());
+            source.setTitle(evidence.getTitle());
+            source.setScopeName(evidence.getKnowledgeScopeName());
+            source.setVenueName(evidence.getVenueName());
+            source.setCourtName(evidence.getCourtName());
+            source.setPreview(preview(evidence.getText(), 120));
+            source.setScore(evidence.getScore());
+            source.setContentHash(evidence.getContentHash() == null
+                    ? null
+                    : evidence.getContentHash().substring(0,
+                    Math.min(16, evidence.getContentHash().length())));
+
+            result.getSources().add(source);
+        }
+    }
+
+    /**
+     * 结束本轮:组装结构化回复、提交会话快照、写最终 Trace。
+     */
+    private AgentRunResult finish(AgentRunResult result,
+                                  AgentHarnessRequest request,
+                                  String sessionId,
+                                  RunSession session) {
         if (result == null) {
             result = AgentRunResult.failed("本次没有生成有效回复，请稍后再试。", "EMPTY_RESULT");
         }
@@ -355,12 +457,39 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
             result.setNewMessages(buildSimpleMessages(request.getMessage(), result.getReplyText()));
         }
 
-        boolean committed = messageStore.append(request.getUserId(), sessionId, result.getNewMessages());
+        //1. 组装卡片与动作：全部来自当前会话真实草稿，模型不自造。
+        fillCardsAndActions(result, request.getUserId(), sessionId);
+
+        //2. 计算最终历史与摘要。
+        List<SessionMessage> finalHistory;
+        String summary;
+        int summaryVersion;
+
+        if (session.reactContext != null) {
+            finalHistory = session.reactContext.getMessages();
+            summary = session.reactContext.getSummary();
+            summaryVersion = session.reactContext.getSummaryVersion();
+        } else {
+            finalHistory = new ArrayList<>(session.snapshot == null
+                    ? List.of()
+                    : session.snapshot.getMessages());
+            finalHistory.addAll(result.getNewMessages());
+            summary = session.snapshot == null ? null : session.snapshot.getSummary();
+            summaryVersion = session.snapshot == null ? 0 : session.snapshot.getSummaryVersion();
+        }
+
+        //3. 摘要与裁剪后的消息一次提交。
+        SessionHistory commit = new SessionHistory();
+        commit.setMessages(finalHistory);
+        commit.setSummary(summary);
+        commit.setSummaryVersion(summaryVersion);
+
+        boolean committed = messageStore.saveHistory(request.getUserId(), sessionId, commit);
         result.setSessionCommitted(committed);
 
         if (!committed) {
             trace("SESSION_COMMIT", "会话消息提交失败", sessionId, null, "FAILED",
-                    "session message store append returned false", 0L);
+                    "session history store save failed", 0L);
 
             //文本回复时明确提示，避免用户以为多轮上下文已经保存。
             if (!StringUtils.hasText(result.getDisplayPayload())) {
@@ -368,6 +497,14 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                         + "\n\n（提示：本轮会话记录保存失败，多轮上下文可能不完整。）");
             }
         }
+
+        trace("RESPONSE_ASSEMBLE", "结构化回复组装",
+                "sessionId=" + sessionId,
+                "status=" + result.getStatus()
+                        + ", sources=" + result.getSources().size()
+                        + ", cards=" + result.getCards().size()
+                        + ", actions=" + result.getActions().size(),
+                "SUCCESS", null, 0L);
 
         trace("FINAL_REPLY", "本轮结束: " + result.getStatus(),
                 "sessionId=" + sessionId,
@@ -377,6 +514,49 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                 result.getCostMs());
 
         return result;
+    }
+
+    /**
+     * 组装卡片与动作。
+     * 数据来源是当前会话真实草稿；没有草稿时不渲染任何按钮。
+     */
+    private void fillCardsAndActions(AgentRunResult result, Long userId, String sessionId) {
+        PendingDraft draft;
+
+        try {
+            draft = userId == null ? null : draftStore.get(userId, sessionId);
+        } catch (Exception e) {
+            log.warn("[AgentHarness] 读取待确认草稿失败: {}", e.getMessage());
+            return;
+        }
+
+        if (draft == null) {
+            return;
+        }
+
+        Map<String, Object> card = new LinkedHashMap<>();
+        card.put("type", draft.type().name());
+        card.put("data", draft.data());
+        card.put("confirmToken", draft.confirmToken());
+        result.getCards().add(card);
+
+        String confirmLabel = switch (draft.type()) {
+            case BOOKING -> "确认预约";
+            case SHOPPING -> "确认下单";
+            case CANCEL_BOOKING -> "确认取消预约";
+        };
+
+        Map<String, Object> confirmAction = new LinkedHashMap<>();
+        confirmAction.put("type", "confirm");
+        confirmAction.put("label", confirmLabel);
+        confirmAction.put("command", confirmLabel + " " + draft.confirmToken());
+        result.getActions().add(confirmAction);
+
+        Map<String, Object> cancelAction = new LinkedHashMap<>();
+        cancelAction.put("type", "cancel");
+        cancelAction.put("label", "取消");
+        cancelAction.put("command", "取消");
+        result.getActions().add(cancelAction);
     }
 
     /**
@@ -390,14 +570,32 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
     }
 
     /**
-     * 安静提交，异常分支使用。
+     * 异常分支安静提交。
      */
-    private void commitQuietly(Long userId, String sessionId, AgentRunResult result) {
+    private void commitQuietly(Long userId, String sessionId, AgentRunResult result, RunSession session) {
         try {
-            messageStore.append(userId, sessionId, result.getNewMessages());
+            SessionHistory commit = new SessionHistory();
+            commit.setMessages(session.snapshot == null
+                    ? result.getNewMessages()
+                    : mergeHistory(session.snapshot.getMessages(), result.getNewMessages()));
+            commit.setSummary(session.snapshot == null ? null : session.snapshot.getSummary());
+            commit.setSummaryVersion(session.snapshot == null ? 0 : session.snapshot.getSummaryVersion());
+
+            messageStore.saveHistory(userId, sessionId, commit);
         } catch (Exception e) {
             log.warn("[AgentHarness] 异常分支会话提交失败: {}", e.getMessage());
         }
+    }
+
+    /**
+     * 合并历史与新增消息。
+     */
+    private List<SessionMessage> mergeHistory(List<SessionMessage> base, List<SessionMessage> produced) {
+        List<SessionMessage> merged = new ArrayList<>(base == null ? List.of() : base);
+        if (produced != null) {
+            merged.addAll(produced);
+        }
+        return merged;
     }
 
     /**
@@ -531,6 +729,19 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
         } catch (Exception e) {
             log.warn("[AgentHarness] Trace 写入失败, step={}, reason={}", stepType, e.getMessage());
         }
+    }
+
+    /**
+     * 文本预览。
+     */
+    private String preview(String text, int maxLength) {
+        if (text == null) {
+            return "";
+        }
+
+        String value = text.replaceAll("\\s+", " ").trim();
+
+        return value.length() <= maxLength ? value : value.substring(0, maxLength) + "...";
     }
 
     /**

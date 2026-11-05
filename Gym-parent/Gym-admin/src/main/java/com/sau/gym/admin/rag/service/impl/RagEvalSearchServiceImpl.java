@@ -1,12 +1,15 @@
 package com.sau.gym.admin.rag.service.impl;
 
+import com.sau.gym.admin.rag.retrieval.KnowledgeEvidence;
+import com.sau.gym.admin.rag.retrieval.KnowledgeRetrievalRequest;
+import com.sau.gym.admin.rag.retrieval.KnowledgeRetrievalResult;
+import com.sau.gym.admin.rag.retrieval.KnowledgeRetrievalService;
+import com.sau.gym.admin.rag.retrieval.RetrievalStatus;
 import com.sau.gym.admin.rag.service.RagEvalSearchService;
-import com.sau.gym.admin.rag.service.RagQaService;
-import com.sau.gym.model.dto.rag.RagAskDto;
 import com.sau.gym.model.entity.rag.RagEvalSearchResult;
-import com.sau.gym.model.vo.rag.RagAnswerVO;
 import com.sau.gym.model.vo.rag.RagSourceVO;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -14,75 +17,96 @@ import java.util.List;
 
 /**
  * 作者:hfj
- * 功能:RAG 评估搜索服务实现
- * 作用：
- * 专门给 RAG 评估调用你现有的 RAG 问答能力。
+ * 功能:RAG 检索评估服务实现
+ * 说明:
+ * 第二轮起评估只调用纯检索服务：
+ * 1. topK、minScore 真实作用于本次向量检索，不再事后裁剪冒充不同配置。
+ * 2. 不调用任何生成模型，answer 恒为空；生成质量评测走独立路径另行实现。
+ * 3. “检索是否命中”与“最终回答是否正确”就此分开。
  * 日期: 2026/5/9 19:32
  */
 @Service
 public class RagEvalSearchServiceImpl implements RagEvalSearchService {
 
-    private final RagQaService ragQaService;
+    private final KnowledgeRetrievalService knowledgeRetrievalService;
 
-    public RagEvalSearchServiceImpl(RagQaService ragQaService) {
-        this.ragQaService = ragQaService;
+    public RagEvalSearchServiceImpl(KnowledgeRetrievalService knowledgeRetrievalService) {
+        this.knowledgeRetrievalService = knowledgeRetrievalService;
     }
 
     @Override
     public RagEvalSearchResult search(String question, Integer topK, Double minScore) {
-
-        //1.构造RAG问答请求DTO。
-        //评估模块只负责：1.批量传入标准问题  2.接收RAG返回结果  3.根据返回来源计算Top1/TopK/来源正确率/无答案率
-        RagAskDto dto = new RagAskDto();
-        dto.setQuestion(question);
-
-        //2.调用现有RAG问答服务。
-        RagAnswerVO qaVO = ragQaService.ask(dto);
-
-        //3.构造评估专用返回对象。
         RagEvalSearchResult result = new RagEvalSearchResult();
 
-        //4.如果RAG服务没有返回结果，则认为：1.回答为空  2.命中来源为空
-        if (qaVO == null) {
-            result.setAnswer("");
+        //1. 纯检索，评估参数直接传入检索服务并真实生效。
+        KnowledgeRetrievalResult retrieval = knowledgeRetrievalService.retrieve(
+                KnowledgeRetrievalRequest.builder()
+                        .question(question)
+                        .topK(topK)
+                        .minScore(minScore)
+                        .build()
+        );
+
+        //2. 纯检索评测不生成回答。
+        result.setAnswer("");
+
+        //3. 检索失败时来源为空，由评测层按未命中统计，而不是伪装成无答案用例。
+        if (retrieval.getStatus() == RetrievalStatus.EMBEDDING_FAILED
+                || retrieval.getStatus() == RetrievalStatus.SEARCH_FAILED) {
             result.setSources(new ArrayList<>());
             return result;
         }
 
-        //5.保存模型最终回答。
-        result.setAnswer(qaVO.getAnswer());
-
-        //6.获取 RAG 命中来源。
-        List<RagSourceVO> sources = qaVO.getSources() == null
-                ? new ArrayList<>()
-                : qaVO.getSources();
-
-        //7.只保留前 TopK 个命中来源。评估 TopK 命中率时，只应该看前 K 个结果。
-        if (topK != null && topK > 0 && sources.size() > topK) {
-            sources = sources.subList(0, topK);
+        //4. 证据转来源视图。
+        List<RagSourceVO> sources = new ArrayList<>();
+        if (retrieval.getEvidences() != null) {
+            for (KnowledgeEvidence evidence : retrieval.getEvidences()) {
+                RagSourceVO source = new RagSourceVO();
+                source.setDocId(evidence.getDocId());
+                source.setTitle(evidence.getTitle());
+                source.setKnowledgeScope(evidence.getKnowledgeScope());
+                source.setKnowledgeScopeName(evidence.getKnowledgeScopeName());
+                source.setSourceType(evidence.getSourceType());
+                source.setVenueId(evidence.getVenueId());
+                source.setVenueName(evidence.getVenueName());
+                source.setCourtId(evidence.getCourtId());
+                source.setCourtName(evidence.getCourtName());
+                source.setTopic(evidence.getTopic());
+                source.setTags(evidence.getTags());
+                source.setScore(evidence.getScore());
+                source.setContentPreview(preview(evidence.getText(), 120));
+                sources.add(source);
+            }
         }
 
-        //8.保存截断后的命中来源。
         result.setSources(sources);
 
-        //9.计算最高相似度。
-        Double maxScore = sources.stream()
-                .filter(item -> item.getScore() != null)
+        //5. 相似度统计。
+        result.setMaxScore(sources.stream()
                 .map(RagSourceVO::getScore)
+                .filter(score -> score != null)
                 .max(Comparator.naturalOrder())
-                .orElse(null);
+                .orElse(null));
 
-        //10.计算最低命中相似度。
-        Double minHitScore = sources.stream()
-                .filter(item -> item.getScore() != null)
+        result.setMinScore(sources.stream()
                 .map(RagSourceVO::getScore)
+                .filter(score -> score != null)
                 .min(Comparator.naturalOrder())
-                .orElse(null);
-
-        //11.写入评估搜索结果。
-        result.setMaxScore(maxScore);
-        result.setMinScore(minHitScore);
+                .orElse(null));
 
         return result;
+    }
+
+    /**
+     * 文本预览。
+     */
+    private String preview(String text, int maxLength) {
+        if (!StringUtils.hasText(text)) {
+            return "";
+        }
+
+        String value = text.replaceAll("\\s+", " ").trim();
+
+        return value.length() <= maxLength ? value : value.substring(0, maxLength) + "...";
     }
 }

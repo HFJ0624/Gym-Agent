@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sau.gym.admin.agent.context.AgentContextBudgeter;
 import com.sau.gym.admin.agent.context.TokenEstimator;
+import com.sau.gym.admin.agent.harness.interceptor.ModelCallPurpose;
 import com.sau.gym.admin.agent.harness.interceptor.ModelCallRequest;
 import com.sau.gym.admin.agent.harness.interceptor.ModelInvocationChain;
 import com.sau.gym.admin.agent.harness.interceptor.ModelInvocationInterceptor;
@@ -17,11 +18,16 @@ import com.sau.gym.admin.agent.llm.LlmMessage;
 import com.sau.gym.admin.agent.llm.LlmToolCall;
 import com.sau.gym.admin.agent.llm.LlmToolDefinition;
 import com.sau.gym.admin.agent.memory.model.SessionMessage;
+import com.sau.gym.admin.agent.service.AgentTraceService;
 import com.sau.gym.admin.agent.tool.AgentToolSchemaBuilder;
 import com.sau.gym.admin.agent.tool.ToolResultCompactor;
 import com.sau.gym.admin.agent.tool.executor.AgentToolExecuteContext;
 import com.sau.gym.admin.agent.tool.executor.AgentToolExecuteResult;
 import com.sau.gym.admin.agent.tool.registry.GymAgentToolRegistry;
+import com.sau.gym.admin.rag.answer.CitationExtractor;
+import com.sau.gym.admin.rag.answer.KnowledgePrompts;
+import com.sau.gym.admin.rag.retrieval.EvidenceRegistry;
+import com.sau.gym.admin.rag.retrieval.KnowledgeEvidence;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -72,6 +78,8 @@ public class DefaultReActRuntime implements ReActRuntime {
 
     private final ObjectMapper objectMapper;
 
+    private final AgentTraceService agentTraceService;
+
     @Autowired
     public DefaultReActRuntime(List<ModelInvocationInterceptor> modelInterceptors,
                                List<ToolInvocationInterceptor> toolInterceptors,
@@ -80,7 +88,8 @@ public class DefaultReActRuntime implements ReActRuntime {
                                ToolResultCompactor resultCompactor,
                                AgentContextBudgeter contextBudgeter,
                                ObjectMapper objectMapper,
-                               LlmClient llmClient) {
+                               LlmClient llmClient,
+                               AgentTraceService agentTraceService) {
         this.modelChain = ModelInvocationChain.of(modelInterceptors, llmClient);
         this.toolChain = new ToolInvocationChain(toolInterceptors, this::invokeTool);
         this.registry = registry;
@@ -88,6 +97,7 @@ public class DefaultReActRuntime implements ReActRuntime {
         this.resultCompactor = resultCompactor;
         this.contextBudgeter = contextBudgeter;
         this.objectMapper = objectMapper;
+        this.agentTraceService = agentTraceService;
     }
 
     /**
@@ -99,7 +109,8 @@ public class DefaultReActRuntime implements ReActRuntime {
                                AgentToolSchemaBuilder schemaBuilder,
                                ToolResultCompactor resultCompactor,
                                AgentContextBudgeter contextBudgeter,
-                               ObjectMapper objectMapper) {
+                               ObjectMapper objectMapper,
+                               AgentTraceService agentTraceService) {
         this.modelChain = modelChain;
         this.toolChain = toolChain;
         this.registry = registry;
@@ -107,6 +118,7 @@ public class DefaultReActRuntime implements ReActRuntime {
         this.resultCompactor = resultCompactor;
         this.contextBudgeter = contextBudgeter;
         this.objectMapper = objectMapper;
+        this.agentTraceService = agentTraceService;
     }
 
     @Override
@@ -122,7 +134,9 @@ public class DefaultReActRuntime implements ReActRuntime {
         produced.add(userMessage);
 
         List<LlmToolDefinition> tools = schemaBuilder.build(runContext.getAllowedToolCodes());
-        int toolSchemaTokens = estimateToolSchemaTokens(tools);
+        int fixedTokenOverhead = estimateToolSchemaTokens(tools)
+                + TokenEstimator.estimate(runContext.getSystemPrompt())
+                + TokenEstimator.estimate(runContext.getSummary());
 
         int attempt = 0;
         int repeatTerminations = 0;
@@ -139,16 +153,17 @@ public class DefaultReActRuntime implements ReActRuntime {
                             degradeText("模型调用轮数已达上限"));
                 }
 
-                //每次模型调用前按完整轮次裁剪历史，保留当前输入与关键状态。
-                contextBudgeter.enforce(runContext, toolSchemaTokens);
+                //每次模型调用前做上下文预算控制：优先摘要，失败降级为完整轮次裁剪。
+                contextBudgeter.enforce(runContext, fixedTokenOverhead);
 
                 attempt++;
 
                 ModelCallRequest modelRequest = ModelCallRequest.builder()
                         .runContext(runContext)
-                        .messages(toLlmMessages(runContext.getMessages()))
+                        .messages(buildRequestMessages(runContext))
                         .tools(tools)
                         .attempt(attempt)
+                        .purpose(ModelCallPurpose.AGENT)
                         .build();
 
                 LlmChatResponse response = modelChain.proceed(modelRequest);
@@ -168,7 +183,10 @@ public class DefaultReActRuntime implements ReActRuntime {
                                 "模型没有返回有效内容，请稍后重试。", "EMPTY_MODEL_CONTENT");
                     }
 
-                    return complete(runContext, produced, start, content.trim());
+                    //本轮使用过知识证据时，校验并修正回答中的引用标签。
+                    content = validateOrRepairCitations(runContext, produced, content.trim());
+
+                    return complete(runContext, produced, start, content);
                 }
 
                 if ("length".equalsIgnoreCase(response.finishReason())) {
@@ -239,6 +257,200 @@ public class DefaultReActRuntime implements ReActRuntime {
     }
 
     /**
+     * 组装模型请求消息：系统提示 + 历史摘要 + 会话历史。
+     * system 与 summary 不持久化在 messages 中，由这里在每次请求时拼接。
+     */
+    private List<LlmMessage> buildRequestMessages(AgentRunContext runContext) {
+        List<LlmMessage> requestMessages = new ArrayList<>();
+
+        if (StringUtils.hasText(runContext.getSystemPrompt())) {
+            requestMessages.add(LlmMessage.system(runContext.getSystemPrompt()));
+        }
+
+        if (StringUtils.hasText(runContext.getSummary())) {
+            requestMessages.add(LlmMessage.system(
+                    "〖历史会话摘要〗\n" + runContext.getSummary()
+                            + "\n（摘要仅用于理解上下文，不代表当前业务事实；预约、订单、草稿状态必须以工具结果和后端状态为准。）"
+            ));
+        }
+
+        requestMessages.addAll(toLlmMessages(runContext.getMessages()));
+        return requestMessages;
+    }
+
+    /**
+     * 校验并修正最终回答中的知识引用。
+     * 1. 没有使用知识证据时直接返回。
+     * 2. 引用不合法时最多做一次修正（计入辅助调用预算）。
+     * 3. 仍失败则返回受控资料展示，不编造来源。
+     */
+    private String validateOrRepairCitations(AgentRunContext runContext,
+                                             List<SessionMessage> produced,
+                                             String content) {
+        EvidenceRegistry registry = runContext.getEvidenceRegistry();
+
+        if (registry == null || registry.isEmpty()) {
+            return content;
+        }
+
+        List<KnowledgeEvidence> registered = new ArrayList<>(registry.all());
+        List<String> labels = CitationExtractor.extract(content);
+        boolean valid = isCitationValid(labels, registry);
+
+        traceCitationValidate(labels, valid, registry.size());
+
+        if (valid) {
+            registry.markUsed(labels);
+            return content;
+        }
+
+        //一次有预算的修正。
+        List<String> validLabels = new ArrayList<>();
+        registered.forEach(item -> validLabels.add(item.getCitationLabel()));
+
+        try {
+            ModelCallRequest repairRequest = ModelCallRequest.builder()
+                    .runContext(runContext)
+                    .messages(List.of(LlmMessage.user(
+                            KnowledgePrompts.repairPrompt(content, validLabels, registered))))
+                    .purpose(ModelCallPurpose.ANSWER_REPAIR)
+                    .attempt(1)
+                    .build();
+
+            LlmChatResponse repaired = modelChain.proceed(repairRequest);
+
+            if (repaired != null && StringUtils.hasText(repaired.content())) {
+                List<String> repairedLabels = CitationExtractor.extract(repaired.content());
+
+                if (isCitationValid(repairedLabels, registry)) {
+                    traceCitationValidate(repairedLabels, true, registry.size());
+
+                    registry.markUsed(repairedLabels);
+
+                    //同步更新已产生的 assistant 消息，保证历史与最终回复一致。
+                    updateLastAssistantContent(produced, repaired.content().trim());
+
+                    return repaired.content().trim();
+                }
+
+                traceCitationValidate(repairedLabels, false, registry.size());
+            }
+        } catch (AgentBudgetExceededException e) {
+            log.warn("[AgentRuntime] 引用修正预算不足: {}", e.getReasonCode());
+            traceCitationValidate(List.of(), false, registry.size());
+        } catch (LlmException e) {
+            log.warn("[AgentRuntime] 引用修正调用失败: {}", e.getMessage());
+            traceCitationValidate(List.of(), false, registry.size());
+        }
+
+        //修正仍失败：返回受控资料展示，不编造来源。
+        String fallback = controlledEvidenceDisplay(registered);
+        updateLastAssistantContent(produced, fallback);
+
+        //展示的资料就是本次实际使用的来源。
+        List<String> allLabels = new ArrayList<>();
+        registered.forEach(item -> allLabels.add(item.getCitationLabel()));
+        registry.markUsed(allLabels);
+
+        return fallback;
+    }
+
+    /**
+     * 引用是否合法：全部标签已登记，且至少引用了一个标签。
+     */
+    private boolean isCitationValid(List<String> labels, EvidenceRegistry registry) {
+        if (labels == null || labels.isEmpty()) {
+            return false;
+        }
+
+        for (String label : labels) {
+            if (registry.get(label) == null) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 受控资料展示文本。
+     */
+    private String controlledEvidenceDisplay(List<KnowledgeEvidence> registered) {
+        StringBuilder builder = new StringBuilder();
+        builder.append("暂时无法基于可靠资料完成综合回答。以下为检索到的资料，请直接查看或换一种问法：\n");
+
+        int index = 0;
+        for (KnowledgeEvidence evidence : registered) {
+            index++;
+
+            builder.append("\n[").append(evidence.getCitationLabel()).append("] ")
+                    .append(evidence.getTitle() == null ? "无标题" : evidence.getTitle())
+                    .append("（").append(evidence.getKnowledgeScopeName());
+
+            if (StringUtils.hasText(evidence.getVenueName())) {
+                builder.append("，场馆：").append(evidence.getVenueName());
+            }
+
+            builder.append("）\n")
+                    .append(previewText(evidence.getText(), 160))
+                    .append("\n");
+
+            if (index >= 5) {
+                break;
+            }
+        }
+
+        return builder.toString();
+    }
+
+    /**
+     * 更新最后一条 assistant 消息内容。
+     */
+    private void updateLastAssistantContent(List<SessionMessage> produced, String content) {
+        for (int i = produced.size() - 1; i >= 0; i--) {
+            SessionMessage message = produced.get(i);
+
+            if ("assistant".equals(message.getRole())
+                    && (message.getToolCalls() == null || message.getToolCalls().isEmpty())) {
+                message.setContent(content);
+                return;
+            }
+        }
+    }
+
+    /**
+     * 记录引用校验 Trace。
+     */
+    private void traceCitationValidate(List<String> labels, boolean valid, int registeredCount) {
+        try {
+            agentTraceService.addStep(
+                    "EVIDENCE_VALIDATE",
+                    valid ? "引用校验通过" : "引用校验未通过",
+                    "registered=" + registeredCount,
+                    "citations=" + labels,
+                    valid ? "SUCCESS" : "FAILED",
+                    valid ? null : "回答引用了未登记的标签或没有引用",
+                    0L
+            );
+        } catch (Exception e) {
+            log.warn("[AgentRuntime] Trace 写入失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 文本预览。
+     */
+    private String previewText(String text, int maxLength) {
+        if (text == null) {
+            return "";
+        }
+
+        String value = text.replaceAll("\\s+", " ").trim();
+
+        return value.length() <= maxLength ? value : value.substring(0, maxLength) + "...";
+    }
+
+    /**
      * 链尾执行器:构造显式上下文并调用 Registry。
      */
     private AgentToolExecuteResult invokeTool(ToolCallRequest request) {
@@ -251,6 +463,7 @@ public class DefaultReActRuntime implements ReActRuntime {
         executeContext.setRunId(runContext.getRunId());
         executeContext.setOriginalQuestion(runContext.getOriginalQuestion());
         executeContext.setBusinessContext(runContext.getBusinessContext());
+        executeContext.setEvidenceRegistry(runContext.getEvidenceRegistry());
         executeContext.setRemainingBudgetMs(runContext.remainingTimeMs());
         executeContext.setParams(request.getArguments() == null
                 ? new LinkedHashMap<>()

@@ -2,6 +2,7 @@ package com.sau.gym.admin.agent.tool.executor;
 
 import com.sau.gym.admin.agent.memory.model.AgentBusinessContext;
 import com.sau.gym.admin.enums.AgentIntent;
+import com.sau.gym.admin.rag.retrieval.EvidenceRegistry;
 import lombok.Data;
 
 import java.io.Serializable;
@@ -71,6 +72,13 @@ public class AgentToolExecuteContext implements Serializable {
      * 里面包含最近场馆、最近场地、预约日期、开始时间、结束时间等结构化槽位。
      */
     private AgentBusinessContext businessContext;
+
+    /**
+     * 本次运行的证据登记上下文。
+     * 知识检索工具把命中的证据登记进来并分配 K1、K2 引用标签，
+     * 最终回答的引用合法性由后端基于该上下文校验。
+     */
+    private transient EvidenceRegistry evidenceRegistry;
 
     /**
      * 工具入参。

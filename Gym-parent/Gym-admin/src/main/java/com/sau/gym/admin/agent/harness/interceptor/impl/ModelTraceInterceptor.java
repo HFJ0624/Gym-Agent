@@ -1,5 +1,6 @@
 package com.sau.gym.admin.agent.harness.interceptor.impl;
 
+import com.sau.gym.admin.agent.harness.interceptor.ModelCallPurpose;
 import com.sau.gym.admin.agent.harness.interceptor.ModelCallRequest;
 import com.sau.gym.admin.agent.harness.interceptor.ModelInvocationChain;
 import com.sau.gym.admin.agent.harness.interceptor.ModelInvocationInterceptor;
@@ -31,12 +32,17 @@ public class ModelTraceInterceptor implements ModelInvocationInterceptor {
     public LlmChatResponse intercept(ModelCallRequest request, ModelInvocationChain chain) {
         long start = System.currentTimeMillis();
 
+        //辅助用途（摘要/修正）与主循环调用分开命名，便于区分记账。
+        String stepName = request.getPurpose() == null || request.getPurpose() == ModelCallPurpose.AGENT
+                ? "第 " + request.getAttempt() + " 次模型请求"
+                : request.getPurpose() + " 辅助模型调用";
+
         try {
             LlmChatResponse response = chain.proceed(request);
 
             agentTraceService.addStep(
                     "MODEL_CALL",
-                    "第 " + request.getAttempt() + " 次模型请求",
+                    stepName,
                     "messages=" + sizeOf(request) + ", tools=" + (request.getTools() == null ? 0 : request.getTools().size()),
                     buildSuccessOutput(response),
                     "SUCCESS",
@@ -49,7 +55,7 @@ public class ModelTraceInterceptor implements ModelInvocationInterceptor {
         } catch (LlmException e) {
             agentTraceService.addStep(
                     "MODEL_CALL",
-                    "第 " + request.getAttempt() + " 次模型请求失败",
+                    stepName,
                     "messages=" + sizeOf(request),
                     null,
                     "FAILED",

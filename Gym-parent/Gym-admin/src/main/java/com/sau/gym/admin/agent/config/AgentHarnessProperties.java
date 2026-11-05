@@ -18,9 +18,35 @@ public class AgentHarnessProperties {
 
     /**
      * 单轮最多发起多少次 Agent 模型请求（含失败重试计数）。
-     * 注意: RAG 工具内部的模型调用不计入该预算。
+     * 注意: 仅统计 AGENT 用途的主循环调用，RAG 工具内部的检索与独立问答不计入该预算。
      */
     private int maxAgentModelCalls = 6;
+
+    /**
+     * 辅助模型调用次数上限（会话摘要、回答修正等共享）。
+     * 置 0 表示不限制，但总调用上限仍然生效。
+     */
+    private int maxAuxModelCalls = 3;
+
+    /**
+     * 本轮模型调用总次数上限（主循环 + 辅助），防止辅助调用不受控。
+     */
+    private int maxTotalModelCalls = 10;
+
+    /**
+     * 上下文占用达到该比例时触发历史摘要（0.75 = 75%）。
+     */
+    private double summaryTriggerRatio = 0.75D;
+
+    /**
+     * 保留的最近完整轮次数量，摘要只处理更早的历史。
+     */
+    private int summaryKeepRecentTurns = 4;
+
+    /**
+     * 摘要文本的 Token 估算上限。
+     */
+    private int summaryMaxTokens = 800;
 
     /**
      * 单轮最多派发多少次工具调用（按派发尝试计数，包含被拒绝的调用）。

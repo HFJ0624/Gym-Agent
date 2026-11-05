@@ -43,6 +43,12 @@ public interface KnowledgeDocumentMapper {
     KnowledgeDocument selectById(@Param("id") Long id);
 
     /**
+     * 根据 ID 批量查询知识文档。
+     * 供检索证据有效性校验使用，一次查询所有命中文档，避免每个 chunk 查一次库。
+     */
+    List<KnowledgeDocument> selectByIds(@Param("ids") List<Long> ids);
+
+    /**
      * 更新知识文档。
      *
      * 注意：

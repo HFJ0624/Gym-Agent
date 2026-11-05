@@ -1,5 +1,6 @@
 package com.sau.gym.admin.agent.store;
 
+import com.sau.gym.admin.agent.memory.model.SessionHistory;
 import com.sau.gym.admin.agent.memory.model.SessionMessage;
 import com.sau.gym.admin.agent.memory.service.impl.RedisAgentSessionMessageStore;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -12,6 +13,7 @@ import org.springframework.data.redis.core.ValueOperations;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +46,15 @@ class AgentSessionIsolationTest {
     private Map<String, PendingDraft> draftMap;
 
     private AgentDraftStore draftStore;
+
+    /**
+     * 构造测试用会话快照。
+     */
+    private SessionHistory historyOf(SessionMessage... messages) {
+        SessionHistory history = new SessionHistory();
+        history.setMessages(new ArrayList<>(List.of(messages)));
+        return history;
+    }
 
     @BeforeEach
     @SuppressWarnings("unchecked")
@@ -87,18 +98,18 @@ class AgentSessionIsolationTest {
 
     @Test
     void 同一用户不同会话的消息历史互不影响() {
-        messageStore.append(1L, "session-a", List.of(
+        messageStore.saveHistory(1L, "session-a", historyOf(
                 SessionMessage.user("我是A会话"),
                 SessionMessage.assistant("A会话回复")
         ));
 
-        messageStore.append(1L, "session-b", List.of(
+        messageStore.saveHistory(1L, "session-b", historyOf(
                 SessionMessage.user("我是B会话"),
                 SessionMessage.assistant("B会话回复")
         ));
 
-        List<SessionMessage> sessionA = messageStore.load(1L, "session-a");
-        List<SessionMessage> sessionB = messageStore.load(1L, "session-b");
+        List<SessionMessage> sessionA = messageStore.loadHistory(1L, "session-a").getMessages();
+        List<SessionMessage> sessionB = messageStore.loadHistory(1L, "session-b").getMessages();
 
         assertEquals(2, sessionA.size());
         assertEquals("我是A会话", sessionA.get(0).getContent());
@@ -109,27 +120,59 @@ class AgentSessionIsolationTest {
 
     @Test
     void 不同用户相同sessionId也不串数据() {
-        messageStore.append(1L, "shared", List.of(SessionMessage.user("用户1")));
-        messageStore.append(2L, "shared", List.of(SessionMessage.user("用户2")));
+        messageStore.saveHistory(1L, "shared", historyOf(SessionMessage.user("用户1")));
+        messageStore.saveHistory(2L, "shared", historyOf(SessionMessage.user("用户2")));
 
-        assertEquals("用户1", messageStore.load(1L, "shared").get(0).getContent());
-        assertEquals("用户2", messageStore.load(2L, "shared").get(0).getContent());
+        assertEquals("用户1", messageStore.loadHistory(1L, "shared").getMessages().get(0).getContent());
+        assertEquals("用户2", messageStore.loadHistory(2L, "shared").getMessages().get(0).getContent());
     }
 
     @Test
     void 没有配对工具调用的历史应被丢弃() {
         SessionMessage orphanTool = SessionMessage.tool("call_missing", "query", "{}");
 
-        messageStore.append(1L, "session-a", List.of(
+        messageStore.saveHistory(1L, "session-a", historyOf(
                 SessionMessage.user("你好"),
                 orphanTool,
                 SessionMessage.assistant("你好")
         ));
 
-        List<SessionMessage> messages = messageStore.load(1L, "session-a");
+        List<SessionMessage> messages = messageStore.loadHistory(1L, "session-a").getMessages();
 
         assertEquals(2, messages.size());
         assertTrue(messages.stream().noneMatch(message -> "tool".equals(message.getRole())));
+    }
+
+    @Test
+    void 摘要与消息在同一次快照中保存() {
+        SessionHistory history = new SessionHistory();
+        history.setSummary("用户想预约A场馆羽毛球场，尚未确定时间。");
+        history.setSummaryVersion(2);
+        history.setMessages(List.of(
+                SessionMessage.user("那明天晚上呢"),
+                SessionMessage.assistant("已生成预约草稿")
+        ));
+
+        assertTrue(messageStore.saveHistory(1L, "session-s", history));
+
+        SessionHistory loaded = messageStore.loadHistory(1L, "session-s");
+
+        assertEquals("用户想预约A场馆羽毛球场，尚未确定时间。", loaded.getSummary());
+        assertEquals(2, loaded.getSummaryVersion());
+        assertEquals(2, loaded.getMessages().size());
+    }
+
+    @Test
+    void 旧版纯数组历史可以兼容读取() {
+        //模拟第一轮写入的纯消息数组。
+        String legacyJson = "[{\"role\":\"user\",\"content\":\"旧消息\"}]";
+        stringStore.put("agent:session:messages:1:session-legacy", legacyJson);
+
+        SessionHistory loaded = messageStore.loadHistory(1L, "session-legacy");
+
+        assertNull(loaded.getSummary());
+        assertEquals(1, loaded.getMessages().size());
+        assertEquals("旧消息", loaded.getMessages().get(0).getContent());
     }
 
     @Test

@@ -1,0 +1,42 @@
+{
+  "version": "1.0.0",
+  "description": "体育场馆智能客服场景 SOP 目录。SOP 只描述处理方法与追问顺序，业务事实（价格、规则、库存）一律来自知识检索或业务工具。",
+  "sops": [
+    {
+      "name": "knowledge-consult",
+      "description": "规则与知识咨询处理说明",
+      "version": "1.0.0",
+      "applicableIntents": ["RAG_KNOWLEDGE", "VENUE_QUERY", "COURT_QUERY", "SLOT_QUERY", "ORDER_QUERY", "SMALL_TALK"],
+      "requiredSlots": [],
+      "allowedTools": ["ask_gym_knowledge", "query_venue_list", "query_notice_list"],
+      "bodyPath": "agent/sop/knowledge-consult.md"
+    },
+    {
+      "name": "booking-assist",
+      "description": "预约协助处理说明",
+      "version": "1.0.0",
+      "applicableIntents": ["BOOKING_DRAFT"],
+      "requiredSlots": ["venueId", "courtId", "bookingDate", "startTime", "endTime"],
+      "allowedTools": ["create_booking_draft", "ask_gym_knowledge", "query_venue_list", "query_notice_list"],
+      "bodyPath": "agent/sop/booking-assist.md"
+    },
+    {
+      "name": "cancel-assist",
+      "description": "取消预约协助处理说明",
+      "version": "1.0.0",
+      "applicableIntents": ["BOOKING_CANCEL"],
+      "requiredSlots": ["bookingId"],
+      "allowedTools": ["query_cancelable_booking", "create_cancel_booking_draft", "ask_gym_knowledge"],
+      "bodyPath": "agent/sop/cancel-assist.md"
+    },
+    {
+      "name": "shopping-assist",
+      "description": "商品下单协助处理说明",
+      "version": "1.0.0",
+      "applicableIntents": ["SHOPPING_QUERY"],
+      "requiredSlots": ["productName"],
+      "allowedTools": ["create_shopping_draft", "ask_gym_knowledge"],
+      "bodyPath": "agent/sop/shopping-assist.md"
+    }
+  ]
+}

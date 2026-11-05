@@ -28,6 +28,8 @@ import com.sau.gym.admin.agent.tool.executor.AgentToolExecuteResult;
 import com.sau.gym.admin.agent.tool.executor.AgentToolParamDefinition;
 import com.sau.gym.admin.agent.tool.registry.GymAgentToolRegistry;
 import com.sau.gym.admin.enums.AgentRiskLevel;
+import com.sau.gym.admin.rag.retrieval.EvidenceRegistry;
+import com.sau.gym.admin.rag.retrieval.KnowledgeEvidence;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -123,9 +125,14 @@ class DefaultReActRuntimeTest {
                 registry,
                 new AgentToolSchemaBuilder(registry),
                 new ToolResultCompactor(objectMapper),
-                new AgentContextBudgeter(),
+                new AgentContextBudgeter(
+                        mock(com.sau.gym.admin.agent.context.AgentSessionSummarizer.class),
+                        traceService,
+                        properties
+                ),
                 objectMapper,
-                llmClient
+                llmClient,
+                traceService
         );
     }
 
@@ -332,6 +339,96 @@ class DefaultReActRuntimeTest {
         assertTrue(toolMessage.getContent().contains("\"status\":\"SUCCESS\""));
     }
 
+    @Test
+    void 回答引用合法标签时应标记使用来源() {
+        queryExecutor.setHandler(context -> {
+            KnowledgeEvidence evidence = new KnowledgeEvidence();
+            evidence.setEvidenceId("1:0:abcdef0123456789");
+            evidence.setDocId(1L);
+            evidence.setTitle("退款规则");
+            evidence.setText("取消预约后可以申请退款。");
+            context.getEvidenceRegistry().register(evidence);
+
+            return AgentToolExecuteResult.success(
+                    "已检索到 1 条资料证据（引用标签 K1）。",
+                    Map.of("evidences", List.of(Map.of("citationLabel", "K1", "title", "退款规则")))
+            );
+        });
+
+        llmClient.enqueue(toolCallResponse("call_1", TOOL_QUERY, "{\"keyword\":\"退款\"}"));
+        llmClient.enqueue(textResponse("根据资料 [K1]，取消预约后可以申请退款。"));
+
+        AgentRunContext context = newContext(Set.of(TOOL_QUERY));
+        context.setEvidenceRegistry(new EvidenceRegistry());
+
+        AgentRunResult result = runtime.run(context);
+
+        assertEquals(AgentRunStatus.COMPLETED, result.getStatus());
+        assertTrue(result.getReplyText().contains("[K1]"));
+        assertEquals(1, context.getEvidenceRegistry().usedEvidences().size());
+        assertEquals("K1", context.getEvidenceRegistry().usedEvidences().get(0).getCitationLabel());
+    }
+
+    @Test
+    void 回答引用未登记标签时应修正一次() {
+        queryExecutor.setHandler(context -> {
+            KnowledgeEvidence evidence = new KnowledgeEvidence();
+            evidence.setEvidenceId("1:0:abcdef0123456789");
+            context.getEvidenceRegistry().register(evidence);
+
+            return AgentToolExecuteResult.success("已检索到 1 条资料证据（引用标签 K1）。", Map.of());
+        });
+
+        llmClient.enqueue(toolCallResponse("call_1", TOOL_QUERY, "{\"keyword\":\"退款\"}"));
+        //第一次回答引用了不存在的 K99。
+        llmClient.enqueue(textResponse("根据资料 [K99]，取消预约后可以申请退款。"));
+        //修正后引用合法。
+        llmClient.enqueue(textResponse("根据资料 [K1]，取消预约后可以申请退款。"));
+
+        AgentRunContext context = newContext(Set.of(TOOL_QUERY));
+        context.setEvidenceRegistry(new EvidenceRegistry());
+
+        AgentRunResult result = runtime.run(context);
+
+        assertEquals(AgentRunStatus.COMPLETED, result.getStatus());
+        assertTrue(result.getReplyText().contains("[K1]"), "修正后应使用合法标签");
+        assertFalse(result.getReplyText().contains("K99"));
+        assertEquals(1, context.getEvidenceRegistry().usedEvidences().size());
+        assertEquals(1, context.getAuxModelCallCount(), "修正调用应计入辅助预算");
+    }
+
+    @Test
+    void 修正失败时应返回受控资料展示且不编造来源() {
+        queryExecutor.setHandler(context -> {
+            KnowledgeEvidence evidence = new KnowledgeEvidence();
+            evidence.setEvidenceId("1:0:abcdef0123456789");
+            evidence.setTitle("退款规则");
+            evidence.setText("取消预约后可以申请退款。");
+            evidence.setKnowledgeScopeName("平台级知识");
+            context.getEvidenceRegistry().register(evidence);
+
+            return AgentToolExecuteResult.success("已检索到 1 条资料证据（引用标签 K1）。", Map.of());
+        });
+
+        llmClient.enqueue(toolCallResponse("call_1", TOOL_QUERY, "{\"keyword\":\"退款\"}"));
+        llmClient.enqueue(textResponse("根据资料 [K99]，可以退款。"));
+        //修正仍失败。
+        llmClient.enqueue(textResponse("根据资料 [K99]，可以退款。"));
+
+        AgentRunContext context = newContext(Set.of(TOOL_QUERY));
+        context.setEvidenceRegistry(new EvidenceRegistry());
+
+        AgentRunResult result = runtime.run(context);
+
+        assertEquals(AgentRunStatus.COMPLETED, result.getStatus());
+        assertTrue(result.getReplyText().contains("暂时无法基于可靠资料完成综合回答"));
+        assertTrue(result.getReplyText().contains("[K1] 退款规则"), "受控展示必须来自真实证据");
+        assertFalse(result.getReplyText().contains("可以退款。根据资料"), "不应保留编造结论");
+
+        //受控展示的资料就是实际使用的来源。
+        assertEquals(1, context.getEvidenceRegistry().usedEvidences().size());
+    }
+
     // ------------------------------------------------------------------
     // 测试辅助
     // ------------------------------------------------------------------
@@ -347,7 +444,10 @@ class DefaultReActRuntimeTest {
                 new LinkedHashSet<>(allowedTools)
         );
 
-        context.setMessages(new ArrayList<>(List.of(SessionMessage.system("你是测试助手"))));
+        //第二轮起 messages 只保存会话历史（不含系统提示词），
+        //系统提示与摘要由运行时在每次请求时拼接。
+        context.setSystemPrompt("你是测试助手");
+        context.setMessages(new ArrayList<>());
 
         return context;
     }

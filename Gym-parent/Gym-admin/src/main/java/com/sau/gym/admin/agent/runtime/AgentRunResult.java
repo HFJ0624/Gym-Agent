@@ -1,10 +1,12 @@
 package com.sau.gym.admin.agent.runtime;
 
 import com.sau.gym.admin.agent.memory.model.SessionMessage;
+import com.sau.gym.model.vo.agent.AgentSourceVO;
 import lombok.Data;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 作者:hfj
@@ -62,9 +64,34 @@ public class AgentRunResult {
     private long costMs;
 
     /**
+     * 会话标识，由入口服务回填。
+     */
+    private String sessionId;
+
+    /**
+     * 本轮运行标识，由入口服务回填。
+     */
+    private String runId;
+
+    /**
      * 会话历史提交是否成功。
      */
     private boolean sessionCommitted = true;
+
+    /**
+     * 回答实际引用的证据来源（后端校验后）。
+     */
+    private List<AgentSourceVO> sources = new ArrayList<>();
+
+    /**
+     * 草稿等卡片数据，来自真实工具结果与会话草稿。
+     */
+    private List<Map<String, Object>> cards = new ArrayList<>();
+
+    /**
+     * 后端基于当前待办生成的允许操作。
+     */
+    private List<Map<String, Object>> actions = new ArrayList<>();
 
     /**
      * 构造正常完成结果。

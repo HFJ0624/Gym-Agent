@@ -3,6 +3,7 @@ package com.sau.gym.admin.agent.runtime;
 import com.sau.gym.admin.agent.config.AgentHarnessProperties;
 import com.sau.gym.admin.agent.memory.model.AgentBusinessContext;
 import com.sau.gym.admin.agent.memory.model.SessionMessage;
+import com.sau.gym.admin.rag.retrieval.EvidenceRegistry;
 import lombok.Data;
 
 import java.util.ArrayList;
@@ -43,6 +44,30 @@ public class AgentRunContext {
     private String originalQuestion;
 
     /**
+     * 系统提示词。
+     * 不参与会话历史持久化，仅在每次模型请求组装时使用。
+     */
+    private String systemPrompt;
+
+    /**
+     * 历史会话摘要。
+     * 由上下文压缩机制生成，跨轮持久化在会话历史中；
+     * 业务结构化状态（场馆/场地ID、日期时段、草稿与确认状态）仍以 Redis 权威字段为准。
+     */
+    private String summary;
+
+    /**
+     * 摘要版本号，每次摘要成功后递增，便于 Trace 与调试。
+     */
+    private int summaryVersion;
+
+    /**
+     * 本轮证据登记上下文。
+     * 知识工具检索到的证据登记于此，并分配 K1、K2 引用标签。
+     */
+    private EvidenceRegistry evidenceRegistry;
+
+    /**
      * 当前业务上下文。
      */
     private AgentBusinessContext businessContext;
@@ -63,9 +88,19 @@ public class AgentRunContext {
     private long deadlineNanos;
 
     /**
-     * 最大模型请求次数。
+     * 最大模型请求次数（仅 AGENT 用途的主循环调用）。
      */
     private int maxModelCalls;
+
+    /**
+     * 最大辅助模型调用次数（摘要、回答修正等共享）。
+     */
+    private int maxAuxModelCalls;
+
+    /**
+     * 本轮模型调用总次数上限（主循环 + 辅助）。
+     */
+    private int maxTotalModelCalls;
 
     /**
      * 最大工具派发次数。
@@ -88,9 +123,14 @@ public class AgentRunContext {
     private int repeatToolThreshold;
 
     /**
-     * 已发起的模型请求次数。
+     * 已发起的模型请求次数（AGENT 用途）。
      */
     private int modelCallCount;
+
+    /**
+     * 已发起的辅助模型调用次数（摘要、修正等）。
+     */
+    private int auxModelCallCount;
 
     /**
      * 已派发的工具调用次数。
@@ -128,6 +168,8 @@ public class AgentRunContext {
         context.setAllowedToolCodes(allowedToolCodes == null ? new LinkedHashSet<>() : allowedToolCodes);
 
         context.setMaxModelCalls(properties.getMaxAgentModelCalls());
+        context.setMaxAuxModelCalls(properties.getMaxAuxModelCalls());
+        context.setMaxTotalModelCalls(properties.getMaxTotalModelCalls());
         context.setMaxToolCalls(properties.getMaxToolCalls());
         context.setMaxContextTokens(properties.getMaxContextTokens());
         context.setMaxToolResultChars(properties.getMaxToolResultChars());
@@ -155,7 +197,7 @@ public class AgentRunContext {
     }
 
     /**
-     * 是否还有模型调用预算。
+     * 是否还有模型调用预算（AGENT 用途）。
      */
     public boolean hasModelCallBudget() {
         return modelCallCount < maxModelCalls;
@@ -166,6 +208,34 @@ public class AgentRunContext {
      */
     public void consumeModelCall() {
         modelCallCount++;
+    }
+
+    /**
+     * 是否还有辅助模型调用预算（摘要、修正等共享）。
+     */
+    public boolean hasAuxModelCallBudget() {
+        return maxAuxModelCalls <= 0 || auxModelCallCount < maxAuxModelCalls;
+    }
+
+    /**
+     * 消耗一次辅助模型调用预算。
+     */
+    public void consumeAuxModelCall() {
+        auxModelCallCount++;
+    }
+
+    /**
+     * 是否还有本轮模型调用总预算。
+     */
+    public boolean hasTotalModelCallBudget() {
+        return maxTotalModelCalls <= 0 || getTotalModelCallCount() < maxTotalModelCalls;
+    }
+
+    /**
+     * 本轮模型调用总次数。
+     */
+    public int getTotalModelCallCount() {
+        return modelCallCount + auxModelCallCount;
     }
 
     /**
