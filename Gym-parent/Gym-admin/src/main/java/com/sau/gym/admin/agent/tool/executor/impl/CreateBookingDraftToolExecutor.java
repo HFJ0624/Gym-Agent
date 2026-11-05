@@ -326,9 +326,10 @@ public class CreateBookingDraftToolExecutor extends AbstractGymAgentToolExecutor
         //15. 生成确认码。
         String confirmToken = AgentConfirmTokenUtil.generateToken();
 
-        //16. 保存预约草稿到 Redis。
+        //16. 保存预约草稿到 Redis，按 userId + sessionId 隔离。
         draftStore.save(
                 userId,
+                context.getSessionId(),
                 new PendingDraft(
                         PendingDraftType.BOOKING,
                         data,

@@ -33,6 +33,12 @@ public class AgentBusinessContext implements Serializable {
     private Long userId;
 
     /**
+     * 会话ID。
+     * 业务上下文按 userId + sessionId 维度保存，避免不同会话串用最近场馆或场地。
+     */
+    private String sessionId;
+
+    /**
      * 最近一次上下文中的场馆ID。
      * 来源可能是：
      * 1. 前端页面传入的 venueId

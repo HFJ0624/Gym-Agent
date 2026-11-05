@@ -98,10 +98,11 @@ public class GymShoppingTools {
     /***
      *
      * @param userId 用户id
+     * @param sessionId 会话id
      * @return 真正执行商品下单
      */
-    public String confirmPendingShopping(Long userId,String confirmToken) {
-        PendingDraft draft = draftStore.get(userId);
+    public String confirmPendingShopping(Long userId, String sessionId, String confirmToken) {
+        PendingDraft draft = draftStore.get(userId, sessionId);
 
         if (draft == null || draft.type() != PendingDraftType.SHOPPING) {
             return "当前没有待确认的商品下单草稿，可能已经确认、取消或过期。";
@@ -152,7 +153,7 @@ public class GymShoppingTools {
             orderService.CreateShoppingOrder(orderDto);
 
             // 成功后清除草稿
-            draftStore.clear(userId);
+            draftStore.clear(userId, sessionId);
 
             return "下单成功：\n"
                     + "商品：" + goodsName + "\n"

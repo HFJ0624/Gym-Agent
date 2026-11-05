@@ -28,6 +28,24 @@ public class AgentToolExecuteContext implements Serializable {
     private String traceId;
 
     /**
+     * 本次运行的 runId。
+     * traceId 与 runId 每轮独立，sessionId 跨轮稳定，三者不能混用。
+     */
+    private String runId;
+
+    /**
+     * 当前会话ID。
+     * 草稿、业务上下文和会话历史都按 userId + sessionId 维度隔离。
+     */
+    private String sessionId;
+
+    /**
+     * 本轮剩余预算毫秒数。
+     * 工具可据此决定是否还能发起耗时的外部查询。
+     */
+    private Long remainingBudgetMs;
+
+    /**
      * 当前用户ID。
      * 需要登录的工具必须检查这个字段。
      */

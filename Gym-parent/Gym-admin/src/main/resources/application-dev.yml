@@ -68,3 +68,21 @@ gym:
     draft:
       # Agent 草稿过期时间，单位：分钟
       ttl-minutes: 15
+
+    # 自建 Harness 运行预算。
+    # 这些是本轮建议默认值，不是通用标准或压测结论，可按实际调整。
+    harness:
+      # 单轮最多发起多少次 Agent 模型请求（含失败重试计数，不含 RAG 工具内部模型调用）
+      max-agent-model-calls: 6
+      # 单轮最多派发多少次工具调用（按派发尝试计数，包含被拒绝的调用）
+      max-tool-calls: 8
+      # 单轮最长耗时，单位毫秒
+      max-run-duration-ms: 60000
+      # 上下文 Token 估算上限（按字符构成估算，不是服务端精确计数）
+      max-context-tokens: 12000
+      # 单条工具结果写入模型上下文前的最大字符数
+      max-tool-result-chars: 6000
+      # 相同工具 + 相同参数的最大执行次数
+      repeat-tool-threshold: 3
+      # 会话并发锁有效期，单位毫秒
+      session-lock-ttl-ms: 60000

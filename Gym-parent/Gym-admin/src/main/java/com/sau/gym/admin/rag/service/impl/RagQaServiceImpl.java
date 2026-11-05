@@ -89,14 +89,9 @@ public class RagQaServiceImpl implements RagQaService {
         // 5. 根据当前场馆/场地上下文做过滤
         List<EmbeddingMatch<TextSegment>> scopedMatches = filterByScope(matches, dto);
 
-        // 6. 如果过滤后没有结果，就退回使用全局检索结果
-        // 这样可以避免用户在某个场馆页提问平台规则时查不到答案。
-        List<EmbeddingMatch<TextSegment>> finalMatches;
-        if (scopedMatches == null || scopedMatches.isEmpty()) {
-            finalMatches = matches;
-        } else {
-            finalMatches = scopedMatches;
-        }
+        // 6. 指定了场馆或场地时，只使用经确认适用的该范围知识与平台公共知识。
+        // 不能回退到其他场馆的召回结果，否则会把别的场馆规则当成当前场馆规则。
+        List<EmbeddingMatch<TextSegment>> finalMatches = scopedMatches;
 
         // 7. 限制最终进入 prompt 的数量
         if (finalMatches != null && finalMatches.size() > maxResults) {
@@ -106,7 +101,7 @@ public class RagQaServiceImpl implements RagQaService {
         // 8. 没有检索到有效知识时，直接拒答，避免模型胡编
         if (finalMatches == null || finalMatches.isEmpty()) {
             RagAnswerVO vo = new RagAnswerVO();
-            vo.setAnswer("知识库中暂无与该问题相关的信息，请换一种问法，或联系管理员补充场馆或场地知识。");
+            vo.setAnswer(buildNoKnowledgeAnswer(dto));
             vo.setSources(new ArrayList<>());
 
             saveSearchLog(question, vo.getAnswer(), vo.getSources(), null, null);
@@ -214,7 +209,8 @@ public class RagQaServiceImpl implements RagQaService {
                 【回答要求】
                 1. 先直接回答问题。
                 2. 如果涉及规则、开放时间、停车、设施，请说明依据。
-                3. 不要输出无关内容。
+                3. 资料标注的场馆/场地必须与用户当前上下文一致，不一致的资料不得作为依据。
+                4. 不要输出无关内容。
                 """
                 .formatted(context, question);
     }
@@ -341,25 +337,25 @@ public class RagQaServiceImpl implements RagQaService {
      * 根据场馆ID、场地ID过滤检索结果。
      *
      * 过滤策略：
-     * 1. 如果传了 courtId，优先保留：
-     *    - 当前 courtId 的场地级知识
-     *    - 当前 venueId 的场馆级知识
-     *    - 平台级知识/FAQ
+     * 1. 平台级知识（scope=1）适用于所有场馆，保留。
+     * 2. 场馆级知识（scope=2）必须与当前 venueId 一致。
+     * 3. 场地级知识（scope=3）必须与当前 courtId 一致。
+     * 4. 公告级知识（scope=4）未绑定场馆，或绑定的就是当前 venueId 时保留。
+     * 5. FAQ（scope=5）不等于全局适用，只有未绑定场馆或绑定当前场馆时才保留。
+     * 6. 没有 scope 元数据的结果无法确认适用范围，指定范围时不采用。
      *
-     * 2. 如果只传了 venueId，优先保留：
-     *    - 当前 venueId 的场馆级知识
-     *    - 该 venueId 下的场地知识
-     *    - 平台级知识/FAQ
-     *
-     * 3. 如果没有传 venueId/courtId，不过滤。
+     * 指定范围过滤后没有结果就是没有依据，不能回退到其他场馆的知识。
      */
     private List<EmbeddingMatch<TextSegment>> filterByScope(List<EmbeddingMatch<TextSegment>> matches, RagAskDto dto) {
         if (matches == null || matches.isEmpty()) {
             return matches;
         }
 
-        // 没有上下文，不过滤
-        if (dto.getVenueId() == null && dto.getCourtId() == null) {
+        boolean hasVenue = dto.getVenueId() != null;
+        boolean hasCourt = dto.getCourtId() != null;
+
+        // 没有范围上下文时不过滤，由调用方按平台全量知识回答。
+        if (!hasVenue && !hasCourt) {
             return matches;
         }
 
@@ -372,22 +368,31 @@ public class RagQaServiceImpl implements RagQaService {
             Long metadataCourtId = parseLong(segment.metadata().getString("courtId"));
             Integer knowledgeScope = parseInteger(segment.metadata().getString("knowledgeScope"));
 
-            boolean keep = false;
-
-            // 平台级和 FAQ 一律保留，因为它们适用于所有场馆/场地
-            if (knowledgeScope != null && (knowledgeScope == 1 || knowledgeScope == 5)) {
-                keep = true;
+            if (knowledgeScope == null) {
+                //无法确认适用范围的知识，在指定场馆/场地时不能当作依据。
+                continue;
             }
 
-            // 如果当前问题带了 courtId，优先匹配具体场地
-            if (dto.getCourtId() != null && dto.getCourtId().equals(metadataCourtId)) {
-                keep = true;
-            }
+            boolean keep = switch (knowledgeScope) {
+                // 平台级知识。
+                case 1 -> true;
 
-            // 如果当前问题带了 venueId，匹配当前场馆
-            if (dto.getVenueId() != null && dto.getVenueId().equals(metadataVenueId)) {
-                keep = true;
-            }
+                // 场馆级知识，必须与当前场馆一致。
+                case 2 -> hasVenue && dto.getVenueId().equals(metadataVenueId);
+
+                // 场地级知识，必须与当前场地一致。
+                case 3 -> hasCourt && dto.getCourtId().equals(metadataCourtId);
+
+                // 公告级知识，未绑定场馆或是当前场馆公告。
+                case 4 -> metadataVenueId == null
+                        || (hasVenue && dto.getVenueId().equals(metadataVenueId));
+
+                // FAQ 仍需检查适用范围，不能等同于全局适用。
+                case 5 -> metadataVenueId == null
+                        || (hasVenue && dto.getVenueId().equals(metadataVenueId));
+
+                default -> false;
+            };
 
             if (keep) {
                 result.add(match);
@@ -395,6 +400,20 @@ public class RagQaServiceImpl implements RagQaService {
         }
 
         return result;
+    }
+
+    /**
+     * 构造无依据回复。
+     * 指定了场馆或场地时明确说明限定范围，避免用户误以为查的是其他场馆规则。
+     */
+    private String buildNoKnowledgeAnswer(RagAskDto dto) {
+        if (dto.getVenueId() != null || dto.getCourtId() != null) {
+            return "知识库中暂无适用于当前场馆/场地的相关信息。"
+                    + "为避免混入其他场馆规则，本次没有使用其他场馆的资料。"
+                    + "请换一种问法，或联系管理员补充当前场馆知识。";
+        }
+
+        return "知识库中暂无与该问题相关的信息，请换一种问法，或联系管理员补充场馆或场地知识。";
     }
 
     /**

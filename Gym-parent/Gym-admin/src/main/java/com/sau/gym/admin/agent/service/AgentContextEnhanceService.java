@@ -9,16 +9,17 @@ public interface AgentContextEnhanceService {
      * 在调用 Agent 之前准备业务上下文。
      *
      * 主要做三件事：
-     * 1. 从 Redis 中读取用户已有上下文
+     * 1. 从 Redis 中读取当前会话已有上下文
      * 2. 合并本次前端传入的 venueId / courtId
      * 3. 从用户消息中解析日期、时间段、意图等信息
      *
-     * @param userId 用户ID
-     * @param message 用户本轮输入消息
-     * @param dto 前端传入的 Agent 请求参数
+     * @param userId    用户ID
+     * @param sessionId 会话ID
+     * @param message   用户本轮输入消息
+     * @param dto       前端传入的 Agent 请求参数
      * @return 更新后的业务上下文
      */
-    AgentBusinessContext prepareBeforeAgent(Long userId, String message, AgentChatDto dto);
+    AgentBusinessContext prepareBeforeAgent(Long userId, String sessionId, String message, AgentChatDto dto);
 
     /**
      * 在 Agent 调用完成后刷新业务上下文。
@@ -28,9 +29,10 @@ public interface AgentContextEnhanceService {
      * 这时应该把草稿里的准确信息反写到 Redis 上下文中，
      * 方便用户下一轮说“时间改成8点到10点”“还是这个场地”。
      *
-     * @param userId 用户ID
+     * @param userId    用户ID
+     * @param sessionId 会话ID
      */
-    void refreshAfterAgent(Long userId);
+    void refreshAfterAgent(Long userId, String sessionId);
 
     /**
      * 构造传给大模型的上下文提示词。
@@ -50,7 +52,7 @@ public interface AgentContextEnhanceService {
      * 1. 本次前端请求传入的 venueId
      * 2. Redis 上下文中的 lastVenueId
      *
-     * @param dto 前端请求参数
+     * @param dto     前端请求参数
      * @param context Redis 业务上下文
      * @return 有效场馆ID
      */
@@ -63,7 +65,7 @@ public interface AgentContextEnhanceService {
      * 1. 本次前端请求传入的 courtId
      * 2. Redis 上下文中的 lastCourtId
      *
-     * @param dto 前端请求参数
+     * @param dto     前端请求参数
      * @param context Redis 业务上下文
      * @return 有效场地ID
      */

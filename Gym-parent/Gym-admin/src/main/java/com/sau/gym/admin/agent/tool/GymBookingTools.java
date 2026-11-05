@@ -186,11 +186,12 @@ public class GymBookingTools {
     /***
      *
      * @param userId 用户id
+     * @param sessionId 会话id
      * @param confirmToken 确认码
      * @return 真正确认预约
      */
-    public String confirmPendingBooking(Long userId,String confirmToken) {
-        PendingDraft draft = draftStore.get(userId);
+    public String confirmPendingBooking(Long userId, String sessionId, String confirmToken) {
+        PendingDraft draft = draftStore.get(userId, sessionId);
         if (draft == null || draft.type() != PendingDraftType.BOOKING) {
             return "当前没有待确认的预约草稿。";
         }
@@ -229,7 +230,7 @@ public class GymBookingTools {
             courtBookingService.saveCourtBook(bookingDto);
 
             // 成功后清除草稿
-            draftStore.clear(userId);
+            draftStore.clear(userId, sessionId);
 
             return "预约成功：\n"
                     + "场馆：" + venueName + "\n"

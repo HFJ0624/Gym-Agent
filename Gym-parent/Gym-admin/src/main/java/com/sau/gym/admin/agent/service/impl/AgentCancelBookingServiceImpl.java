@@ -1,6 +1,7 @@
 package com.sau.gym.admin.agent.service.impl;
 
 import com.sau.gym.admin.agent.model.AgentCancelableBookingVO;
+import com.sau.gym.admin.agent.model.AgentDraftCreationResult;
 import com.sau.gym.admin.agent.service.AgentCancelBookingService;
 import com.sau.gym.admin.agent.store.AgentDraftStore;
 import com.sau.gym.admin.agent.store.PendingDraft;
@@ -108,23 +109,27 @@ public class AgentCancelBookingServiceImpl implements AgentCancelBookingService 
      * 生成取消预约草稿。
      */
     @Override
-    public String createCancelBookingDraft(Long userId, Long bookingId, String reason) {
+    public AgentDraftCreationResult createCancelBookingDraft(Long userId, String sessionId, Long bookingId, String reason) {
         if (userId == null) {
-            return "请先登录后再取消预约。";
+            return new AgentDraftCreationResult("请先登录后再取消预约。", null);
         }
 
         if (bookingId == null) {
-            return "请提供要取消的预约ID。例如：取消预约 12。";
+            return new AgentDraftCreationResult("请提供要取消的预约ID。例如：取消预约 12。", null);
         }
 
         AgentCancelableBookingVO booking = courtBookingMapper.selectAgentBookingDetail(userId, bookingId);
 
         if (booking == null) {
-            return "未找到该预约，或者该预约不属于当前用户。";
+            return new AgentDraftCreationResult("未找到该预约，或者该预约不属于当前用户。", null);
         }
 
         if (!isCancelable(booking)) {
-            return "该预约当前不能取消。订单状态：" + statusText(booking.getStatus()) + "。已取消、已完成或已开始的预约不能取消。";
+            return new AgentDraftCreationResult(
+                    "该预约当前不能取消。订单状态：" + statusText(booking.getStatus())
+                            + "。已取消、已完成或已开始的预约不能取消。",
+                    null
+            );
         }
 
         String finalReason = StringUtils.hasText(reason) ? reason.trim() : "用户通过 Agent 取消预约";
@@ -150,14 +155,14 @@ public class AgentCancelBookingServiceImpl implements AgentCancelBookingService 
         data.put("needRefund", needRefund);
 
         //保存取消预约草稿到 Redis。用户必须带确认码确认后，才会真正取消预约。
-        draftStore.save(userId, new PendingDraft(
+        draftStore.save(userId, sessionId, new PendingDraft(
                 PendingDraftType.CANCEL_BOOKING,
                 data,
                 LocalDateTime.now(),
                 confirmToken
         ));
 
-        return "已为你生成取消预约草稿：\n"
+        String text = "已为你生成取消预约草稿：\n"
                 + "预约ID：" + booking.getBookingId() + "\n"
                 + "场馆：" + nullToEmpty(booking.getVenueName()) + "\n"
                 + "场地：" + nullToEmpty(booking.getCourtName()) + "\n"
@@ -171,6 +176,8 @@ public class AgentCancelBookingServiceImpl implements AgentCancelBookingService 
                 + "如果确认取消，请回复：确认取消预约 " + confirmToken + "\n"
                 + "如果放弃，请回复：取消\n"
                 + "注意：该取消草稿将在系统设置的草稿过期时间后自动失效。";
+
+        return new AgentDraftCreationResult(text, confirmToken, data);
     }
 
     /**
@@ -182,12 +189,12 @@ public class AgentCancelBookingServiceImpl implements AgentCancelBookingService 
      */
     @Transactional(rollbackFor = Exception.class)
     @Override
-    public String confirmCancelBooking(Long userId, String confirmToken) {
+    public String confirmCancelBooking(Long userId, String sessionId, String confirmToken) {
         if (userId == null) {
             return "请先登录后再确认取消预约。";
         }
 
-        PendingDraft draft = draftStore.get(userId);
+        PendingDraft draft = draftStore.get(userId, sessionId);
 
         if (draft == null || draft.type() != PendingDraftType.CANCEL_BOOKING) {
             return "当前没有待确认的取消预约草稿。";
@@ -214,12 +221,12 @@ public class AgentCancelBookingServiceImpl implements AgentCancelBookingService 
         AgentCancelableBookingVO booking = courtBookingMapper.selectAgentBookingDetail(userId, bookingId);
 
         if (booking == null) {
-            draftStore.clear(userId);
+            draftStore.clear(userId, sessionId);
             return "预约不存在或不属于当前用户，已清除取消草稿。";
         }
 
         if (!isCancelable(booking)) {
-            draftStore.clear(userId);
+            draftStore.clear(userId, sessionId);
             return "该预约当前已不能取消，订单状态：" + statusText(booking.getStatus()) + "。已清除取消草稿。";
         }
 
@@ -238,7 +245,7 @@ public class AgentCancelBookingServiceImpl implements AgentCancelBookingService 
                 "AGENT"
         );
 
-        draftStore.clear(userId);
+        draftStore.clear(userId, sessionId);
 
         return "取消预约成功：\n"
                 + "预约ID：" + booking.getBookingId() + "\n"

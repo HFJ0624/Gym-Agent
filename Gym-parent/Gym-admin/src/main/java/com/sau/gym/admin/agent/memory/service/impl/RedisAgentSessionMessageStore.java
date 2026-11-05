@@ -1,0 +1,166 @@
+package com.sau.gym.admin.agent.memory.service.impl;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sau.gym.admin.agent.memory.model.SessionMessage;
+import com.sau.gym.admin.agent.memory.service.AgentSessionMessageStore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 作者:hfj
+ * 功能:基于 Redis 的会话协议消息存储
+ * 说明:
+ * 1. key 由 userId + sessionId 共同构成，保证同一用户不同会话隔离。
+ * 2. 未登录用户使用 guest 占位，不会与登录用户串数据。
+ * 3. 只保留最近若干条消息，避免无限增长。
+ */
+@Service
+public class RedisAgentSessionMessageStore implements AgentSessionMessageStore {
+
+    private static final Logger log = LoggerFactory.getLogger(RedisAgentSessionMessageStore.class);
+
+    /**
+     * Redis key 前缀。
+     */
+    private static final String KEY_PREFIX = "agent:session:messages:";
+
+    /**
+     * 会话历史有效期，沿用原记忆服务的 6 小时。
+     */
+    private static final Duration TTL = Duration.ofHours(6);
+
+    /**
+     * 最多保留的消息条数。
+     * 一轮带工具调用的对话可能产生 4~6 条消息，40 条约等于 7~8 轮。
+     */
+    private static final int MAX_MESSAGE_COUNT = 40;
+
+    private final StringRedisTemplate stringRedisTemplate;
+
+    private final ObjectMapper objectMapper;
+
+    public RedisAgentSessionMessageStore(StringRedisTemplate stringRedisTemplate,
+                                         ObjectMapper objectMapper) {
+        this.stringRedisTemplate = stringRedisTemplate;
+        this.objectMapper = objectMapper;
+    }
+
+    @Override
+    public List<SessionMessage> load(Long userId, String sessionId) {
+        try {
+            String json = stringRedisTemplate.opsForValue().get(buildKey(userId, sessionId));
+
+            if (!StringUtils.hasText(json)) {
+                return new ArrayList<>();
+            }
+
+            List<SessionMessage> messages = objectMapper.readValue(
+                    json,
+                    new TypeReference<List<SessionMessage>>() {
+                    }
+            );
+
+            return messages == null ? new ArrayList<>() : messages;
+        } catch (Exception e) {
+            //历史读取失败按空历史处理，不影响本轮对话，但要留下可观察日志。
+            log.warn("[AgentSession] 读取会话历史失败, sessionId={}, reason={}", sessionId, e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
+    @Override
+    public boolean append(Long userId, String sessionId, List<SessionMessage> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return true;
+        }
+
+        try {
+            String key = buildKey(userId, sessionId);
+
+            //先合并历史再整体写回，保证顺序稳定且不会出现半截工具配对。
+            List<SessionMessage> all = load(userId, sessionId);
+            all.addAll(messages);
+
+            while (all.size() > MAX_MESSAGE_COUNT) {
+                all.remove(0);
+            }
+
+            //裁剪后仍需保证 tool 消息能找到对应的 assistant tool_calls。
+            all = dropOrphanToolMessages(all);
+
+            String json = objectMapper.writeValueAsString(all);
+            stringRedisTemplate.opsForValue().set(key, json, TTL);
+
+            return true;
+        } catch (Exception e) {
+            //写入失败必须让上层知道，避免宣称会话状态已保存。
+            log.warn("[AgentSession] 写入会话历史失败, sessionId={}, reason={}", sessionId, e.getMessage());
+            return false;
+        }
+    }
+
+    @Override
+    public void clear(Long userId, String sessionId) {
+        try {
+            stringRedisTemplate.delete(buildKey(userId, sessionId));
+        } catch (Exception e) {
+            log.warn("[AgentSession] 清空会话历史失败, sessionId={}, reason={}", sessionId, e.getMessage());
+        }
+    }
+
+    /**
+     * 去掉开头孤立的 tool 消息。
+     * 裁剪时如果正好把 assistant tool_calls 消息删掉，tool 消息就会变成非法历史。
+     */
+    private List<SessionMessage> dropOrphanToolMessages(List<SessionMessage> messages) {
+        List<SessionMessage> result = new ArrayList<>(messages.size());
+
+        java.util.Set<String> knownCallIds = new java.util.HashSet<>();
+
+        for (SessionMessage message : messages) {
+            if (message == null || !StringUtils.hasText(message.getRole())) {
+                continue;
+            }
+
+            if ("assistant".equals(message.getRole())
+                    && message.getToolCalls() != null
+                    && !message.getToolCalls().isEmpty()) {
+                message.getToolCalls().forEach(call -> {
+                    if (call != null && StringUtils.hasText(call.getId())) {
+                        knownCallIds.add(call.getId());
+                    }
+                });
+                result.add(message);
+                continue;
+            }
+
+            if ("tool".equals(message.getRole())) {
+                if (StringUtils.hasText(message.getToolCallId())
+                        && knownCallIds.contains(message.getToolCallId())) {
+                    result.add(message);
+                }
+                continue;
+            }
+
+            result.add(message);
+        }
+
+        return result;
+    }
+
+    /**
+     * 构造 Redis key。
+     */
+    private String buildKey(Long userId, String sessionId) {
+        String userKey = userId == null ? "guest" : String.valueOf(userId);
+        return KEY_PREFIX + userKey + ":" + sessionId;
+    }
+}

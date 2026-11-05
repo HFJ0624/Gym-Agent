@@ -9,6 +9,7 @@ import com.sau.gym.admin.agent.service.AgentEntityResolveService;
 import com.sau.gym.admin.agent.store.AgentBusinessContextStore;
 import com.sau.gym.admin.agent.store.AgentDraftStore;
 import com.sau.gym.admin.agent.store.PendingDraft;
+import com.sau.gym.admin.agent.util.AgentSessionIdUtil;
 import com.sau.gym.admin.enums.PendingDraftType;
 import com.sau.gym.model.dto.agent.AgentChatDto;
 import org.springframework.stereotype.Service;
@@ -52,18 +53,21 @@ public class AgentContextEnhanceServiceImpl implements AgentContextEnhanceServic
      * 6. 保存回 Redis
      */
     @Override
-    public AgentBusinessContext prepareBeforeAgent(Long userId, String message, AgentChatDto dto) {
+    public AgentBusinessContext prepareBeforeAgent(Long userId, String sessionId, String message, AgentChatDto dto) {
         if (userId == null) {
             return null;
         }
 
-        AgentBusinessContext context = contextStore.get(userId);
+        //按 userId + sessionId 读取，避免不同会话共用同一份槽位。
+        AgentBusinessContext context = contextStore.get(userId, sessionId);
 
         // Redis 中没有上下文时，创建一个新的上下文对象
         if (context == null) {
             context = new AgentBusinessContext();
             context.setUserId(userId);
         }
+
+        context.setSessionId(AgentSessionIdUtil.normalize(sessionId));
 
         // 记录最近一次用户输入，方便后续排查上下文来源
         context.setLastUserMessage(message);
@@ -141,12 +145,12 @@ public class AgentContextEnhanceServiceImpl implements AgentContextEnhanceServic
      * 这些信息比用户原始文本更准确，所以要反写到上下文里。
      */
     @Override
-    public void refreshAfterAgent(Long userId) {
+    public void refreshAfterAgent(Long userId, String sessionId) {
         if (userId == null) {
             return;
         }
 
-        PendingDraft draft = agentDraftStore.get(userId);
+        PendingDraft draft = agentDraftStore.get(userId, sessionId);
 
         if (draft == null) {
             return;
@@ -157,12 +161,14 @@ public class AgentContextEnhanceServiceImpl implements AgentContextEnhanceServic
             return;
         }
 
-        AgentBusinessContext context = contextStore.get(userId);
+        AgentBusinessContext context = contextStore.get(userId, sessionId);
 
         if (context == null) {
             context = new AgentBusinessContext();
             context.setUserId(userId);
         }
+
+        context.setSessionId(AgentSessionIdUtil.normalize(sessionId));
 
         Map<?, ?> data = draft.data();
 

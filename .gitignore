@@ -41,6 +41,9 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 
+# WorkBuddy Agent 工作区数据（会话记忆、临时脚本等）
+.workbuddy/
+
 # JVM crash logs
 hs_err_pid*
 replay_pid*

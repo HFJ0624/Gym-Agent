@@ -112,6 +112,45 @@
                   确认码：{{ msg.draft.confirmToken }}
                 </div>
               </template>
+
+              <!-- 取消预约草稿 -->
+              <template v-else-if="msg.draft.type === 'CANCEL_BOOKING'">
+                <div class="draft-row">
+                  <span class="label">预约ID</span>
+                  <span class="value">{{ msg.draft.bookingId || '-' }}</span>
+                </div>
+
+                <div class="draft-row">
+                  <span class="label">场馆</span>
+                  <span class="value">{{ msg.draft.venueName || '-' }}</span>
+                </div>
+
+                <div class="draft-row">
+                  <span class="label">场地</span>
+                  <span class="value">{{ msg.draft.courtName || '-' }}</span>
+                </div>
+
+                <div class="draft-row">
+                  <span class="label">日期</span>
+                  <span class="value">{{ msg.draft.bookingDate || '-' }}</span>
+                </div>
+
+                <div class="draft-row">
+                  <span class="label">时间</span>
+                  <span class="value">
+                    {{ msg.draft.startTime || '-' }} - {{ msg.draft.endTime || '-' }}
+                  </span>
+                </div>
+
+                <div class="draft-row total">
+                  <span class="label">金额</span>
+                  <span class="value">¥{{ msg.draft.totalPrice || '-' }}</span>
+                </div>
+
+                <div class="draft-token">
+                  确认码：{{ msg.draft.confirmToken }}
+                </div>
+              </template>
             </div>
 
             <!-- AI 回复中的确认按钮 -->
@@ -228,6 +267,41 @@ const sending = ref(false)
 const authStore = useAuth()
 
 /**
+ * 会话标识的本地存储 key。
+ *
+ * 同一个浏览器标签页内复用同一个 sessionId，
+ * 保证后端会话历史、业务上下文和草稿都落在同一个会话里。
+ */
+const SESSION_STORAGE_KEY = 'GYM_AI_SESSION_ID'
+
+/**
+ * 生成新的会话标识。
+ * 后端限制为字母、数字、下划线、短横线，长度不超过 64。
+ */
+function createSessionId() {
+  if (window.crypto && window.crypto.randomUUID) {
+    return window.crypto.randomUUID().replace(/-/g, '')
+  }
+
+  return 'ai' + Date.now() + Math.random().toString(16).slice(2, 10)
+}
+
+/**
+ * 当前会话标识。
+ * 没有新会话功能时，标签页级别的隔离已经足够。
+ */
+const sessionId = ref((() => {
+  let id = sessionStorage.getItem(SESSION_STORAGE_KEY)
+
+  if (!id) {
+    id = createSessionId()
+    sessionStorage.setItem(SESSION_STORAGE_KEY, id)
+  }
+
+  return id
+})())
+
+/**
  * 当前登录用户ID。
  *
  * 后端 Agent 记忆、Redis 草稿、确认码校验都依赖 userId。
@@ -320,16 +394,22 @@ const sendMessage = async text => {
       {
         message: msg,
         venueId: props.venueId ? Number(props.venueId) : null,
-        courtId: props.courtId ? Number(props.courtId) : null
+        courtId: props.courtId ? Number(props.courtId) : null,
+        sessionId: sessionId.value
       },
 
       /**
        * 后端 @RequestParam Long userId 接收这里。
+       * token 用于后端校验登录态，身份以登录态为准。
        */
       {
         params: {
           userId: userId.value
         },
+
+        headers: authStore.token
+          ? { token: authStore.token }
+          : {},
 
         /**
          * Agent + RAG + 工具调用可能较慢。
@@ -337,6 +417,23 @@ const sendMessage = async text => {
         timeout: 120000
       }
     )
+
+    /**
+     * 后端明确返回非成功业务码时，展示后端消息。
+     * 例如前端传入的 userId 与登录态不一致会被拒绝。
+     */
+    if (data && data.code && data.code !== 200) {
+      messages.value.push({
+        role: 'ai',
+        content: data.message || '请求未成功，请稍后再试。',
+        draft: null,
+        actions: null,
+        actionUsed: false,
+        actionLoading: false
+      })
+
+      return
+    }
 
     /**
      * 新版解析逻辑：
@@ -548,6 +645,8 @@ function parseToolExecuteResult(result) {
       draft = parseBookingDraftFromToolResult(result, actions)
     } else if (actions && actions.type === 'SHOPPING') {
       draft = parseShoppingDraftFromToolResult(result, actions)
+    } else if (actions && actions.type === 'CANCEL_BOOKING') {
+      draft = parseCancelDraftFromToolResult(result, actions)
     }
   }
 
@@ -589,12 +688,26 @@ function parseActionsFromToolResult(result, message) {
     }
   }
 
-  if (result.confirmAction === 'confirm_shopping') {
+  if (result.confirmAction === 'confirm_shopping' || result.confirmAction === 'confirm_shopping_order') {
     return {
       type: 'SHOPPING',
       token,
       confirmLabel: '确认下单',
       confirmCommand: `确认下单 ${token}`
+    }
+  }
+
+  /**
+   * 取消预约草稿：
+   * 后端 confirmAction = confirm_cancel_booking，
+   * 前端转换成后端确认流程能识别的中文命令。
+   */
+  if (result.confirmAction === 'confirm_cancel_booking') {
+    return {
+      type: 'CANCEL_BOOKING',
+      token,
+      confirmLabel: '确认取消预约',
+      confirmCommand: `确认取消预约 ${token}`
     }
   }
 
@@ -695,6 +808,30 @@ function parseShoppingDraftFromToolResult(result, actions) {
     goodsName: data.goodsName || data.productName || '-',
     quantity: data.quantity || '-',
     price: data.price || data.unitPrice || '-',
+    totalPrice: data.totalPrice || '-',
+    confirmToken: extra.confirmToken || actions.token
+  }
+}
+
+/**
+ * 从统一工具结果中构造取消预约草稿卡片。
+ *
+ * 后端 data 字段：
+ * bookingId / venueName / courtName / bookingDate / startTime / endTime / totalPrice
+ */
+function parseCancelDraftFromToolResult(result, actions) {
+  const data = toPlainObject(result.data)
+  const extra = toPlainObject(result.extra)
+
+  return {
+    type: 'CANCEL_BOOKING',
+    title: '取消预约草稿',
+    bookingId: data.bookingId || '-',
+    venueName: data.venueName || '-',
+    courtName: data.courtName || '-',
+    bookingDate: data.bookingDate || data.date || '-',
+    startTime: data.startTime || '-',
+    endTime: data.endTime || '-',
     totalPrice: data.totalPrice || '-',
     confirmToken: extra.confirmToken || actions.token
   }

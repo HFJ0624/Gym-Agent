@@ -150,9 +150,10 @@ public class CreateShoppingDraftToolExecutor extends AbstractGymAgentToolExecuto
 
         String confirmToken = AgentConfirmTokenUtil.generateToken();
 
-        // 保存商品下单草稿到 Redis。
+        // 保存商品下单草稿到 Redis，按 userId + sessionId 隔离。
         draftStore.save(
                 userId,
+                context.getSessionId(),
                 new PendingDraft(
                         PendingDraftType.SHOPPING,
                         data,
@@ -176,7 +177,7 @@ public class CreateShoppingDraftToolExecutor extends AbstractGymAgentToolExecuto
         return AgentToolExecuteResult.needConfirm(
                 message,
                 data,
-                "confirm_shopping_order"
+                "confirm_shopping"
         ).addExtra("confirmToken", confirmToken);
     }
 }

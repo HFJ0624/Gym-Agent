@@ -1,30 +1,28 @@
 package com.sau.gym.admin.agent.config;
 
-import com.sau.gym.admin.agent.assistant.GymAgentAssistant;
-import com.sau.gym.admin.agent.tool.*;
 import dev.langchain4j.memory.chat.ChatMemoryProvider;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
-import dev.langchain4j.service.AiServices;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
 /**
  * 作者:hfj
- * 功能:大模型+记忆+工具调用形成AI助手
+ * 功能:LangChain4j 底层模型与记忆配置
+ * 说明:
+ * 前台客服编排已经切换到自建 GymAgentHarness + ReActRuntime + LlmClient，
+ * 这里不再创建 GymAgentAssistant。保留的 ChatModel 与 ChatMemoryProvider
+ * 仅服务于 MCP 相关 Assistant，属于本轮明确保留的底层依赖。
  * 日期: 2026/4/23 14:29
  */
 @Configuration
 public class LangChain4jAgentConfig {
 
     /**
-     * 创建大模型对象
-     * 作用：
-     * 1. 告诉 LangChain4j 你要连接哪个模型服务
-     * 2. 配置 baseUrl、apiKey、modelName、temperature
-     * 这里的 OpenAiChatModel 不代表你一定在用 OpenAI，
-     * 只要你的服务是 OpenAI-compatible 接口格式就能接。
+     * 创建大模型对象。
+     * MCP 的 Assistant 仍使用该 Bean，前台客服不再使用。
      */
     @Bean
     public ChatModel gymChatModel(
@@ -34,52 +32,24 @@ public class LangChain4jAgentConfig {
             @Value("${gym.ai.temperature:0.1}") Double temperature
     ) {
         return OpenAiChatModel.builder()
-                .baseUrl(baseUrl)       // 模型服务基础地址
-                .apiKey(apiKey)         // 鉴权密钥
-                .modelName(modelName)   // 模型名
-                .temperature(temperature) // 温度，越低越稳
-                .logRequests(true)      // 打印请求日志，方便调试
-                .logResponses(true)     // 打印响应日志，方便调试
+                .baseUrl(baseUrl)
+                .apiKey(apiKey)
+                .modelName(modelName)
+                .temperature(temperature)
+                .logRequests(true)
+                .logResponses(true)
                 .build();
     }
 
     /**
-     * 创建对话记忆提供器
-     * 每个 userId 会对应一个独立的聊天记忆窗口。
-     * 这里最多保留最近 20 条消息。
-     * 作用：
-     * 让模型记得上下文，不然每次都像第一次聊天。
+     * MCP Assistant 使用的会话记忆提供器。
+     * 前台客服会话历史已经统一到 AgentSessionMessageStore，不再使用该记忆窗口。
      */
     @Bean
     public ChatMemoryProvider gymChatMemoryProvider() {
         return memoryId -> MessageWindowChatMemory.builder()
-                .id(memoryId) // memoryId 通常就是 userId
-                .maxMessages(20) //最多保存20条消息
-                .build();
-    }
-
-    /**
-     * 创建 AI 助手对象
-     * 这里最关键：
-     * 1. 指定大模型
-     * 2. 指定会话记忆
-     * 3. 指定工具类
-     * LangChain4j 会在运行时自动生成 GymAgentAssistant 的实现类。
-     */
-    @Bean
-    public GymAgentAssistant gymAgentAssistant(
-            ChatModel gymChatModel,
-            ChatMemoryProvider gymChatMemoryProvider,
-            GymQueryTools gymQueryTools,
-            GymBookingTools gymBookingTools,
-            GymShoppingTools gymShoppingTools,
-            GymRagTools gymRagTools,
-            GymCancelBookingTools gymCancelBookingTools
-    ) {
-        return AiServices.builder(GymAgentAssistant.class)
-                .chatModel(gymChatModel)                  // 绑定模型
-                .chatMemoryProvider(gymChatMemoryProvider) // 绑定会话记忆
-                .tools(gymQueryTools, gymBookingTools, gymShoppingTools,gymRagTools,gymCancelBookingTools) // 注册工具(查询工具,预约工具,下单工具,rag工具)
+                .id(memoryId)
+                .maxMessages(20)
                 .build();
     }
 }

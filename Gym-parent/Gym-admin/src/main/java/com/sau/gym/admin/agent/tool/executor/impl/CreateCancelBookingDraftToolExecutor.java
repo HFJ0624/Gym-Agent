@@ -1,5 +1,6 @@
 package com.sau.gym.admin.agent.tool.executor.impl;
 
+import com.sau.gym.admin.agent.model.AgentDraftCreationResult;
 import com.sau.gym.admin.agent.service.AgentCancelBookingService;
 import com.sau.gym.admin.agent.service.AgentToolGuardService;
 import com.sau.gym.admin.agent.tool.AgentToolCodes;
@@ -102,12 +103,31 @@ public class CreateCancelBookingDraftToolExecutor extends AbstractGymAgentToolEx
             reason = "用户通过Agent取消预约";
         }
 
-        String text = cancelBookingService.createCancelBookingDraft(userId, bookingId, reason);
+        AgentDraftCreationResult draft = cancelBookingService.createCancelBookingDraft(
+                userId,
+                context.getSessionId(),
+                bookingId,
+                reason
+        );
 
-        return AgentToolExecuteResult.needConfirm(
-                "取消预约草稿已生成，请用户确认后再执行取消。",
-                text,
+        //草稿创建失败时不能返回 NEED_CONFIRM，否则前端会展示一张无效卡片。
+        if (!StringUtils.hasText(draft.getConfirmToken())) {
+            return AgentToolExecuteResult.failed(draft.getText(), "cancel draft not created");
+        }
+
+        AgentToolExecuteResult result = AgentToolExecuteResult.needConfirm(
+                draft.getText(),
+                draft.getData(),
                 "confirm_cancel_booking"
         );
+
+        //确认码必须来自后端草稿，不能让模型重新生成。
+        result.addExtra("confirmToken", draft.getConfirmToken());
+
+        if (draft.getData() != null) {
+            result.addExtra("bookingId", draft.getData().get("bookingId"));
+        }
+
+        return result;
     }
 }
