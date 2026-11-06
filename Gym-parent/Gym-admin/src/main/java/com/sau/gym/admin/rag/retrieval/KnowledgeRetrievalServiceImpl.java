@@ -96,7 +96,13 @@ public class KnowledgeRetrievalServiceImpl implements KnowledgeRetrievalService 
         long start = System.currentTimeMillis();
 
         KnowledgeRetrievalResult result = new KnowledgeRetrievalResult();
-        result.setScoped(request != null && (request.getVenueId() != null || request.getCourtId() != null));
+
+        List<Long> compareVenueIds = request == null ? null : request.getCompareVenueIds();
+        boolean compareMode = compareVenueIds != null && !compareVenueIds.isEmpty();
+        boolean scoped = compareMode
+                || (request != null && (request.getVenueId() != null || request.getCourtId() != null));
+
+        result.setScoped(scoped);
 
         int topK = resolveTopK(request);
         double minScore = resolveMinScore(request);
@@ -138,17 +144,53 @@ public class KnowledgeRetrievalServiceImpl implements KnowledgeRetrievalService 
             Map<Long, KnowledgeDocument> documents = loadDocuments(candidates);
 
             //4. 范围与有效性过滤。
+            //COMPARE 模式：每个场馆分别做范围过滤并保留归属，各自截取 topK 后合并；
+            //它不是无范围放行的理由。
+            List<KnowledgeEvidence> evidences = new ArrayList<>();
+
+            if (compareMode) {
+                Map<Long, KnowledgeEvidenceFilter.FilterOutcome> outcomes = new LinkedHashMap<>();
+
+                for (Long venueId : compareVenueIds) {
+                    KnowledgeEvidenceFilter.FilterOutcome outcome = evidenceFilter.filter(
+                            candidates, venueId, null, true, documents, strictVersion);
+                    outcomes.put(venueId, outcome);
+                    result.setRejectedCount(result.getRejectedCount() + outcome.rejected.size());
+
+                    List<KnowledgeEvidence> venueEvidences =
+                            buildEvidences(outcome.kept, documents, topK);
+                    evidences.addAll(venueEvidences);
+                }
+
+                evidences.sort(Comparator.comparing(KnowledgeEvidence::getScore,
+                        Comparator.nullsLast(Comparator.reverseOrder())));
+
+                StringBuilder detail = new StringBuilder("COMPARE 模式，按场馆分别过滤：");
+                outcomes.forEach((venueId, outcome) -> detail.append(" venue")
+                        .append(venueId).append("=kept").append(outcome.kept.size()).append(" "));
+
+                result.setStatus(evidences.isEmpty()
+                        ? RetrievalStatus.INVALID_SCOPE
+                        : RetrievalStatus.HIT);
+                result.setDetail(detail.toString().trim());
+                result.setEvidences(evidences);
+
+                finishTrace(result, request, start);
+                return result;
+            }
+
             KnowledgeEvidenceFilter.FilterOutcome outcome = evidenceFilter.filter(
                     candidates,
                     request.getVenueId(),
                     request.getCourtId(),
+                    scoped,
                     documents,
                     strictVersion
             );
             result.setRejectedCount(outcome.rejected.size());
 
             //5. 去重、排序、截断到 topK，组装证据。
-            List<KnowledgeEvidence> evidences = buildEvidences(outcome.kept, documents, topK);
+            evidences = buildEvidences(outcome.kept, documents, topK);
             result.setEvidences(evidences);
 
             if (evidences.isEmpty()) {

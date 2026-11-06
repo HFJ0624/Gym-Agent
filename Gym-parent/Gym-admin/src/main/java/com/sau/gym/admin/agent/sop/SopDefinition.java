@@ -47,6 +47,13 @@ public class SopDefinition {
     private List<String> allowedTools = new ArrayList<>();
 
     /**
+     * 办理型触发短语。
+     * 只有用户输入包含这些明确办理措辞时，咨询场景才会附带本 SOP；
+     * 纯规则咨询（例如“取消规则是什么”）不会因为它而进入办理流程。
+     */
+    private List<String> triggerPatterns = new ArrayList<>();
+
+    /**
      * 正文资源路径。
      */
     private String bodyPath;

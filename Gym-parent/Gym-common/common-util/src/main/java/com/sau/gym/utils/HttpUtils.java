@@ -1,6 +1,6 @@
 package com.sau.gym.utils;
 
-import com.alibaba.excel.util.StringUtils;
+import cn.hutool.core.util.StrUtil;
 import org.apache.http.HttpResponse;
 import org.apache.http.NameValuePair;
 import org.apache.http.client.HttpClient;
@@ -124,7 +124,7 @@ public class HttpUtils {
             request.addHeader(e.getKey(), e.getValue());
         }
 
-        if (StringUtils.isNotBlank(body)) {
+        if (StrUtil.isNotBlank(body)) {
             request.setEntity(new StringEntity(body, "utf-8"));
         }
 
@@ -185,7 +185,7 @@ public class HttpUtils {
             request.addHeader(e.getKey(), e.getValue());
         }
 
-        if (StringUtils.isNotBlank(body)) {
+        if (StrUtil.isNotBlank(body)) {
             request.setEntity(new StringEntity(body, "utf-8"));
         }
 
@@ -250,7 +250,7 @@ public class HttpUtils {
     private static String buildUrl(String host, String path, Map<String, String> querys) throws UnsupportedEncodingException {
         StringBuilder sbUrl = new StringBuilder();
         sbUrl.append(host);
-        if (!StringUtils.isBlank(path)) {
+        if (!StrUtil.isBlank(path)) {
             sbUrl.append(path);
         }
         if (null != querys) {
@@ -259,12 +259,12 @@ public class HttpUtils {
                 if (0 < sbQuery.length()) {
                     sbQuery.append("&");
                 }
-                if (StringUtils.isBlank(query.getKey()) && !StringUtils.isBlank(query.getValue())) {
+                if (StrUtil.isBlank(query.getKey()) && !StrUtil.isBlank(query.getValue())) {
                     sbQuery.append(query.getValue());
                 }
-                if (!StringUtils.isBlank(query.getKey())) {
+                if (!StrUtil.isBlank(query.getKey())) {
                     sbQuery.append(query.getKey());
-                    if (!StringUtils.isBlank(query.getValue())) {
+                    if (!StrUtil.isBlank(query.getValue())) {
                         sbQuery.append("=");
                         sbQuery.append(URLEncoder.encode(query.getValue(), "utf-8"));
                     }

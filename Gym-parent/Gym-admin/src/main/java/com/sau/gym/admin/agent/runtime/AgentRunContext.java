@@ -143,10 +143,12 @@ public class AgentRunContext {
     private Map<String, Integer> toolSignatureCounts = new HashMap<>();
 
     /**
-     * 会话锁是否仍然有效。
-     * 锁丢失后运行时必须停止后续步骤。
+     * 会话锁有效性提供器。
+     * 由 Harness 接线到真实 LockHandle 的租约状态（isLeaseValid），
+     * 锁可能在模型请求期间丢失，因此不能在创建上下文时复制一次布尔值。
+     * 未接线时（例如纯单元测试）默认视为有效。
      */
-    private volatile boolean lockAlive = true;
+    private transient java.util.function.BooleanSupplier lockValidSupplier;
 
     /**
      * 根据配置创建运行上下文。
@@ -281,9 +283,16 @@ public class AgentRunContext {
 
     /**
      * 判断本轮是否还能继续执行。
-     * 锁丢失、超时、中断任一成立都必须终止。
+     * 锁失效（真实租约状态）、超时、中断任一成立都必须终止。
      */
     public boolean canContinue() {
-        return lockAlive && !isExpired() && !Thread.currentThread().isInterrupted();
+        return isLockValid() && !isExpired() && !Thread.currentThread().isInterrupted();
+    }
+
+    /**
+     * 真实会话锁租约状态。
+     */
+    public boolean isLockValid() {
+        return lockValidSupplier == null || lockValidSupplier.getAsBoolean();
     }
 }

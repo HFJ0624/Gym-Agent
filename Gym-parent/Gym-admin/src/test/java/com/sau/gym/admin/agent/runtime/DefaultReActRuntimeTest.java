@@ -322,6 +322,29 @@ class DefaultReActRuntimeTest {
     }
 
     @Test
+    void 锁在模型调用期间失效后不得继续派发工具() {
+        java.util.concurrent.atomic.AtomicBoolean lockValid = new java.util.concurrent.atomic.AtomicBoolean(true);
+
+        queryExecutor.setHandler(context -> AgentToolExecuteResult.success("不应执行", Map.of()));
+
+        //模型响应返回前锁失效：运行时必须在派发工具前重新检查真实锁状态。
+        llmClient.enqueue(toolCallResponse("call_1", TOOL_QUERY, "{\"keyword\":\"羽毛球\"}"),
+                () -> lockValid.set(false));
+        llmClient.enqueue(textResponse("不会被消费"));
+
+        AgentRunContext context = newContext(Set.of(TOOL_QUERY));
+        context.setEvidenceRegistry(new EvidenceRegistry());
+        context.setLockValidSupplier(lockValid::get);
+
+        AgentRunResult result = runtime.run(context);
+
+        assertEquals(AgentRunStatus.BUDGET_EXCEEDED, result.getStatus());
+        assertEquals("LOCK_LOST", result.getErrorCode());
+        assertEquals(0, queryExecutor.getInvocations(), "锁失效后不得派发任何工具");
+        assertTrue(result.getReplyText().contains("部分操作未完成"));
+    }
+
+    @Test
     void 工具结果过长时应压缩且保留关键状态() {
         properties.setMaxToolResultChars(200);
         queryExecutor.setHandler(context -> AgentToolExecuteResult.success(
@@ -501,25 +524,36 @@ class DefaultReActRuntimeTest {
     }
 
     /**
-     * 按队列返回预设响应的 Fake 客户端。
+     * 按队列返回预设响应的 Fake 客户端，支持响应返回前的副作用（例如模拟锁失效）。
      */
     static class FakeLlmClient implements LlmClient {
 
-        private final Deque<LlmChatResponse> responses = new ArrayDeque<>();
+        private record Entry(com.sau.gym.admin.agent.llm.LlmChatResponse response, Runnable sideEffect) {
+        }
 
-        void enqueue(LlmChatResponse response) {
-            responses.add(response);
+        private final java.util.Deque<Entry> entries = new ArrayDeque<>();
+
+        void enqueue(com.sau.gym.admin.agent.llm.LlmChatResponse response) {
+            entries.add(new Entry(response, null));
+        }
+
+        void enqueue(com.sau.gym.admin.agent.llm.LlmChatResponse response, Runnable sideEffect) {
+            entries.add(new Entry(response, sideEffect));
         }
 
         @Override
-        public LlmChatResponse chat(com.sau.gym.admin.agent.llm.LlmChatRequest request) {
-            LlmChatResponse response = responses.poll();
+        public com.sau.gym.admin.agent.llm.LlmChatResponse chat(com.sau.gym.admin.agent.llm.LlmChatRequest request) {
+            Entry entry = entries.poll();
 
-            if (response == null) {
+            if (entry == null) {
                 throw new IllegalStateException("FakeLlmClient 没有更多响应");
             }
 
-            return response;
+            if (entry.sideEffect() != null) {
+                entry.sideEffect().run();
+            }
+
+            return entry.response();
         }
     }
 

@@ -41,7 +41,8 @@ public class EvidenceRegistry {
 
     /**
      * 登记一条证据，返回分配的引用标签。
-     * 同一 evidenceId 重复登记时返回已有标签，不产生重复证据。
+     * 同一 evidenceId 重复登记时返回已有标签，
+     * 并把规范标签写回传入的新对象，避免调用方从新对象读取到 null。
      */
     public synchronized String register(KnowledgeEvidence evidence) {
         if (evidence == null || !StringUtils.hasText(evidence.getEvidenceId())) {
@@ -50,6 +51,7 @@ public class EvidenceRegistry {
 
         String exists = labelByEvidenceId.get(evidence.getEvidenceId());
         if (exists != null) {
+            evidence.setCitationLabel(exists);
             return exists;
         }
 

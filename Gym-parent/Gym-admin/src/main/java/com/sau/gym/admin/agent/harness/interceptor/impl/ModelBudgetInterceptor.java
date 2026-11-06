@@ -29,7 +29,7 @@ public class ModelBudgetInterceptor implements ModelInvocationInterceptor {
             throw new AgentBudgetExceededException("RUN_CONTEXT_MISSING", "运行上下文缺失");
         }
 
-        if (!runContext.isLockAlive()) {
+        if (!runContext.isLockValid()) {
             throw new AgentBudgetExceededException("LOCK_LOST", "会话锁已失效，已停止后续模型调用");
         }
 

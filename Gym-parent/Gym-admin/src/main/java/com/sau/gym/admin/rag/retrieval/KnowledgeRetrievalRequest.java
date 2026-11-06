@@ -37,4 +37,11 @@ public class KnowledgeRetrievalRequest {
      * 为空时使用全局默认配置。
      */
     private Double minScore;
+
+    /**
+     * 明确的跨场馆比较请求的场馆ID列表。
+     * 非空时进入 COMPARE 模式：每个场馆分别做范围过滤并保留归属，
+     * 不能把它当作无范围默认放行的理由。
+     */
+    private java.util.List<Long> compareVenueIds;
 }

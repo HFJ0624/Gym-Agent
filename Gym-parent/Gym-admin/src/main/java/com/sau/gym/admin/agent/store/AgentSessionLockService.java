@@ -6,6 +6,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
+import jakarta.annotation.PreDestroy;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.UUID;
@@ -67,6 +68,14 @@ public class AgentSessionLockService {
     }
 
     /**
+     * 应用销毁时关闭续租调度器，避免线程泄漏。
+     */
+    @PreDestroy
+    public void shutdown() {
+        scheduler.shutdownNow();
+    }
+
+    /**
      * 尝试获取会话锁。
      *
      * @param userId       用户ID，未登录使用 guest
@@ -91,6 +100,11 @@ public class AgentSessionLockService {
 
     /**
      * 锁句柄。
+     * 生命周期判定：
+     * 1. alive 表示明确失效（释放、续租被拒绝）。
+     * 2. leaseDeadlineNanos 记录最近一次确认持有的租约到期时间（单调时钟）。
+     *    续租短暂异常时容忍，但租约到期后 isLeaseValid() 自然变为 false，
+     *    不会异常多久都保持有效。
      */
     public final class LockHandle {
 
@@ -104,20 +118,60 @@ public class AgentSessionLockService {
 
         private final AtomicBoolean released = new AtomicBoolean(false);
 
+        /**
+         * 最近确认的租约到期时间（System.nanoTime() 单调时钟）。
+         */
+        private volatile long leaseDeadlineNanos;
+
         private ScheduledFuture<?> renewTask;
 
         private LockHandle(String key, String token, Duration ttl) {
             this.key = key;
             this.token = token;
             this.ttlMillis = ttl.toMillis();
+            //注意单位：System.nanoTime() 是纳秒，必须用 toNanos() 换算，
+            //否则毫秒数值被当作纳秒，租约形同即期失效。
+            this.leaseDeadlineNanos = System.nanoTime() + ttl.toNanos();
             startRenew();
         }
 
         /**
-         * 锁是否仍然有效。
+         * 锁是否仍然有效（未明确释放/未被判失效）。
          */
         public boolean isAlive() {
             return alive.get();
+        }
+
+        /**
+         * 租约是否仍有效：未明确失效且仍在最近确认的租约期内。
+         * 运行时与提交阶段应使用本方法作为真实依据。
+         */
+        public boolean isLeaseValid() {
+            return alive.get() && System.nanoTime() < leaseDeadlineNanos;
+        }
+
+        /**
+         * 执行一次续租（调度器与测试共用）。
+         *
+         * @return true=续租成功（延长租约）；false=锁已不属于自己（明确失效）
+         */
+        boolean renewOnce() {
+            Long result = stringRedisTemplate.execute(
+                    RENEW_SCRIPT,
+                    Collections.singletonList(key),
+                    token,
+                    String.valueOf(ttlMillis)
+            );
+
+            if (result != null && result == 1L) {
+                leaseDeadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ttlMillis);
+                return true;
+            }
+
+            //续租被拒绝说明锁已不属于自己，必须明确失效。
+            alive.set(false);
+            log.warn("[AgentLock] 会话锁已丢失, key={}", key);
+            return false;
         }
 
         /**
@@ -132,20 +186,10 @@ public class AgentSessionLockService {
                 }
 
                 try {
-                    Long result = stringRedisTemplate.execute(
-                            RENEW_SCRIPT,
-                            Collections.singletonList(key),
-                            token,
-                            String.valueOf(ttlMillis)
-                    );
-
-                    if (result == null || result == 0L) {
-                        //续租失败说明锁已不属于自己，必须停止后续步骤。
-                        alive.set(false);
-                        log.warn("[AgentLock] 会话锁已丢失, key={}", key);
-                    }
+                    renewOnce();
                 } catch (Exception e) {
-                    //Redis 短暂异常不立即判定锁丢失，等待下一次续租。
+                    //Redis 短暂异常不立即判定失效，等待下一次续租；
+                    //若异常持续跨过租约有效期，isLeaseValid() 会自然变为 false。
                     log.warn("[AgentLock] 续租异常, key={}, reason={}", key, e.getMessage());
                 }
             }, period, period, TimeUnit.MILLISECONDS);

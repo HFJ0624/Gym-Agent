@@ -10,6 +10,7 @@ import com.sau.gym.admin.agent.llm.LlmChoice;
 import com.sau.gym.admin.agent.llm.LlmClient;
 import com.sau.gym.admin.agent.llm.LlmResponseMessage;
 import com.sau.gym.admin.agent.memory.model.SessionMessage;
+import com.sau.gym.admin.agent.runtime.AgentBudgetExceededException;
 import com.sau.gym.admin.agent.runtime.AgentRunContext;
 import com.sau.gym.admin.agent.service.AgentTraceService;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,12 +21,12 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
@@ -115,21 +116,23 @@ class AgentContextBudgeterTest {
     }
 
     @Test
-    void 摘要失败且超预算时应降级为完整轮次裁剪() {
+    void 摘要失败且无历史可裁剪仍超限时应明确终止() {
         llmClient.enqueue(textResponse("   "));
 
         AgentRunContext context = newContext();
-        //小预算迫使降级裁剪。
+        //小预算迫使降级裁剪；剩余单组仍超限时必须抛出上下文预算终态。
         context.setMaxContextTokens(120);
         fillTurns(context.getMessages(), 5);
 
         AgentContextBudgeter budgeter = newBudgeter(newRealSummarizer());
-        budgeter.enforce(context, 20);
 
+        AgentBudgetExceededException exception = assertThrows(AgentBudgetExceededException.class,
+                () -> budgeter.enforce(context, 20));
+
+        assertEquals("CONTEXT_LIMIT", exception.getReasonCode());
         assertNull(context.getSummary());
-        assertTrue(context.getMessages().size() < 10, "降级后应裁剪部分历史");
 
-        //tool_calls 与 tool 结果必须仍然配对。
+        //裁剪按完整轮次进行，tool_calls 与 tool 结果必须仍然配对。
         List<String> callIds = new ArrayList<>();
         context.getMessages().forEach(message -> {
             if (message.getToolCalls() != null) {
@@ -141,6 +144,47 @@ class AgentContextBudgeterTest {
                 context.getMessages().stream().anyMatch(message ->
                         "tool".equals(message.getRole()) && callId.equals(message.getToolCallId())),
                 "tool 调用 " + callId + " 的结果不能被拆散"));
+    }
+
+    @Test
+    void 仅当前超长输入无法裁剪时应终止且不调用模型() {
+        AgentRunContext context = newContext();
+        //只有当前一条超长输入：没有可摘要或裁剪的历史轮次。
+        context.setMaxContextTokens(100);
+        context.getMessages().add(SessionMessage.user("超长输入".repeat(300)));
+
+        AgentContextBudgeter budgeter = newBudgeter(newRealSummarizer());
+
+        AgentBudgetExceededException exception = assertThrows(AgentBudgetExceededException.class,
+                () -> budgeter.enforce(context, 50));
+
+        assertEquals("CONTEXT_LIMIT", exception.getReasonCode());
+        assertFalse(llmClient.hasBeenCalled(), "达到硬上限时不应发起任何模型调用");
+        assertEquals(0, context.getAuxModelCallCount());
+    }
+
+    @Test
+    void 新摘要比旧摘要更长且仍超限时应继续终止() {
+        //摘要返回超长内容，模拟“新摘要比旧摘要长”的情况。
+        AgentSessionSummarizer longSummaryStub = new AgentSessionSummarizer(List.of(), llmClient, properties) {
+            @Override
+            public SummarizeResult summarize(AgentRunContext ctx, String previous, List<SessionMessage> turns) {
+                return SummarizeResult.success("超长摘要".repeat(400));
+            }
+        };
+
+        AgentRunContext context = newContext();
+        context.setMaxContextTokens(600);
+        fillTurns(context.getMessages(), 5);
+
+        AgentContextBudgeter budgeter = newBudgeter(longSummaryStub);
+
+        AgentBudgetExceededException exception = assertThrows(AgentBudgetExceededException.class,
+                () -> budgeter.enforce(context, 50));
+
+        assertEquals("CONTEXT_LIMIT", exception.getReasonCode());
+        //摘要成功后历史被移出，但超长摘要本身导致仍超限。
+        assertTrue(context.getMessages().size() <= 3 * 2, "降级裁剪应尽量保留最近轮次或清空历史");
     }
 
     @Test

@@ -40,7 +40,7 @@ public class ToolBudgetInterceptor implements ToolInvocationInterceptor {
             return failure("运行上下文缺失，已拒绝工具调用。", "RUN_CONTEXT_MISSING");
         }
 
-        if (!runContext.isLockAlive()) {
+        if (!runContext.isLockValid()) {
             return failure("会话已被其他请求接管，本轮已停止工具调用。", "LOCK_LOST");
         }
 

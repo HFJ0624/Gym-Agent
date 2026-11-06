@@ -49,6 +49,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 作者:hfj
@@ -137,11 +138,39 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
 
     /**
      * 单次请求的会话载体。
-     * 保存历史快照与 ReAct 上下文，供结束阶段统一提交。
+     * 保存历史快照、ReAct 上下文与真实锁句柄，供结束阶段统一校验与提交。
      */
-    private static class RunSession {
+    static class RunSession {
         SessionHistory snapshot;
         AgentRunContext reactContext;
+        AgentSessionLockService.LockHandle lockHandle;
+        SessionHistory pendingHistory;
+    }
+
+    /**
+     * 提交会话历史快照。
+     * 真实锁租约失效（过期或被新请求接管）时跳过提交，避免旧请求覆盖新状态。
+     *
+     * @return 是否实际提交成功
+     */
+    boolean commitSessionHistory(Long userId,
+                                 String sessionId,
+                                 RunSession session,
+                                 AgentRunResult result) {
+        if (session.lockHandle != null && !session.lockHandle.isLeaseValid()) {
+            trace("SESSION_COMMIT", "会话锁已失效，跳过会话提交", sessionId, null, "FAILED",
+                    "lock lease invalid, skip commit to avoid overwriting newer session state", 0L);
+            return false;
+        }
+
+        boolean committed = messageStore.saveHistory(userId, sessionId, session.pendingHistory);
+
+        if (!committed) {
+            trace("SESSION_COMMIT", "会话消息提交失败", sessionId, null, "FAILED",
+                    "session history store save failed", 0L);
+        }
+
+        return committed;
     }
 
     @Override
@@ -165,6 +194,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
         }
 
         RunSession session = new RunSession();
+        session.lockHandle = lock;
 
         try {
             trace("HARNESS_START", "开始处理本轮请求",
@@ -239,6 +269,11 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
 
         Long userId = request.getUserId();
         String message = request.getMessage() == null ? "" : request.getMessage().trim();
+
+        //确认/取消属于可变状态操作：锁失效后不再执行，避免旧请求覆盖新请求的待办。
+        if (session.lockHandle != null && !session.lockHandle.isLeaseValid()) {
+            return AgentRunResult.failed("会话状态已失效，请重新发送请求。", "LOCK_LOST");
+        }
 
         return switch (decision.getType()) {
             case CONFIRMATION -> confirmationWorkflow.handle(decision, userId, sessionId, message);
@@ -318,30 +353,57 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                 message
         );
 
-        //按需加载 SOP：allowedTools 与 SOP 建议工具求交集，不能通过 SOP 扩大权限。
-        String sopPrompt = null;
+        //场景选择与工具选择统一到一次规划结果：
+        //1. ToolSelector 先给出规划工具（含组合请求的关键词补充）。
+        //2. SOP 按意图、真实待办草稿类型和明确办理型措辞选择（可多选）。
+        //3. 组合场景取相关 SOP 工具的受控并集后求交集，单个 SOP 不能删掉其他子场景的必要工具；
+        //   纯咨询措辞（如“取消规则是什么”）不会因此进入真实取消办理。
         String intentName = intentResult == null || intentResult.getIntent() == null
                 ? null
                 : intentResult.getIntent().name();
 
-        SopDefinition sop = sopCatalog.select(intentName, hasPendingDraft(userId, sessionId));
+        String draftTypeName = resolveDraftTypeName(userId, sessionId);
+        List<SopDefinition> selectedSops = sopCatalog.selectSops(intentName, message, draftTypeName);
 
-        if (sop != null) {
-            if (sop.getAllowedTools() != null && !sop.getAllowedTools().isEmpty()) {
-                allowedTools.retainAll(sop.getAllowedTools());
+        String sopPrompt = null;
+
+        if (!selectedSops.isEmpty()) {
+            Set<String> allowedBySops = new LinkedHashSet<>();
+            StringBuilder sopText = new StringBuilder();
+
+            for (SopDefinition selected : selectedSops) {
+                if (selected.getAllowedTools() != null) {
+                    allowedBySops.addAll(selected.getAllowedTools());
+                }
+
+                String body = sopCatalog.loadBody(selected);
+
+                if (StringUtils.hasText(body)) {
+                    if (sopText.length() > 0) {
+                        sopText.append("\n\n");
+                    }
+                    sopText.append("SOP: ").append(selected.getName())
+                            .append(" v").append(selected.getVersion()).append("\n")
+                            .append(body);
+                }
             }
 
-            String body = sopCatalog.loadBody(sop);
+            if (!allowedBySops.isEmpty()) {
+                allowedTools.retainAll(allowedBySops);
+            }
 
-            if (StringUtils.hasText(body)) {
-                sopPrompt = "SOP: " + sop.getName() + " v" + sop.getVersion() + "\n" + body;
+            if (sopText.length() > 0) {
+                sopPrompt = sopText.toString();
             }
         }
 
+        String sopNames = selectedSops.stream()
+                .map(selected -> selected.getName() + " v" + selected.getVersion())
+                .collect(java.util.stream.Collectors.joining(","));
+
         trace("SOP_SELECT", "场景 SOP 选择",
-                "intent=" + intentName,
-                (sop == null ? "none" : sop.getName() + " v" + sop.getVersion())
-                        + ", tools=" + allowedTools,
+                "intent=" + intentName + ", draftType=" + draftTypeName,
+                (sopNames.isEmpty() ? "none" : sopNames) + ", tools=" + allowedTools,
                 "SUCCESS", null, 0L);
 
         trace("TOOLS_ALLOWED", "本轮授权工具",
@@ -375,6 +437,12 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
         runContext.setMessages(new ArrayList<>(session.snapshot == null
                 ? List.of()
                 : session.snapshot.getMessages()));
+
+        //把真实锁租约状态接线到运行时：
+        //锁可能在模型请求期间丢失，运行时每次派发前都会通过该提供器重新检查。
+        if (session.lockHandle != null) {
+            runContext.setLockValidSupplier(session.lockHandle::isLeaseValid);
+        }
 
         session.reactContext = runContext;
 
@@ -478,13 +546,14 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
             summaryVersion = session.snapshot == null ? 0 : session.snapshot.getSummaryVersion();
         }
 
-        //3. 摘要与裁剪后的消息一次提交。
-        SessionHistory commit = new SessionHistory();
-        commit.setMessages(finalHistory);
-        commit.setSummary(summary);
-        commit.setSummaryVersion(summaryVersion);
+        session.pendingHistory = new SessionHistory();
+        session.pendingHistory.setMessages(finalHistory);
+        session.pendingHistory.setSummary(summary);
+        session.pendingHistory.setSummaryVersion(summaryVersion);
 
-        boolean committed = messageStore.saveHistory(request.getUserId(), sessionId, commit);
+        //3. 摘要与裁剪后的消息一次提交；提交前用真实锁租约状态做保护，
+        //锁失效（过期/被新请求接管）的旧请求不得覆盖新状态。
+        boolean committed = commitSessionHistory(request.getUserId(), sessionId, session, result);
         result.setSessionCommitted(committed);
 
         if (!committed) {
@@ -571,9 +640,15 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
 
     /**
      * 异常分支安静提交。
+     * 同样受真实锁租约保护，失效时不覆盖。
      */
     private void commitQuietly(Long userId, String sessionId, AgentRunResult result, RunSession session) {
         try {
+            if (session.lockHandle != null && !session.lockHandle.isLeaseValid()) {
+                log.warn("[AgentHarness] 异常分支跳过会话提交：会话锁已失效, sessionId={}", sessionId);
+                return;
+            }
+
             SessionHistory commit = new SessionHistory();
             commit.setMessages(session.snapshot == null
                     ? result.getNewMessages()
@@ -711,6 +786,18 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
             return userId != null && draftStore.hasDraft(userId, sessionId);
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /**
+     * 读取当前待确认草稿类型名，供 SOP 场景判断使用。
+     */
+    private String resolveDraftTypeName(Long userId, String sessionId) {
+        try {
+            PendingDraft draft = userId == null ? null : draftStore.get(userId, sessionId);
+            return draft == null ? null : draft.type().name();
+        } catch (Exception e) {
+            return null;
         }
     }
 

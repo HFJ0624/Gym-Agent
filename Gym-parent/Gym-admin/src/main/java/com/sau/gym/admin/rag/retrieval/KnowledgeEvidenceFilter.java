@@ -13,9 +13,16 @@ import java.util.Map;
  * 功能:知识证据过滤器
  * 说明:
  * 纯逻辑组件，便于单元测试。职责：
- * 1. 适用范围校验（平台/场馆/场地/公告/FAQ）。
- * 2. 权威文档校验：不存在、已删除、已禁用。
- * 3. 内容版本校验：向量 metadata 指纹与权威文档当前指纹比对。
+ * 1. 适用范围校验：范围判定使用权威文档字段（knowledgeScope/venueId/courtId），
+ *    不再用向量 metadata 的数字代替权威归属。
+ * 2. 查询模式：SCOPED（明确了场馆/场地）与 UNSCOPED（两者都没有）。
+ *    UNSCOPED 只放行平台级资料和真正未绑定对象的 FAQ/公告，
+ *    不把任意场馆规则当作公共规则；跨场馆比较必须走 COMPARE 模式分别限定范围。
+ * 3. 绑定限制应用于 FAQ、公告等所有分类：绑定 courtId 的资料只对该场地适用，
+ *    不能当作整个场馆的通用规则。
+ * 4. 范围与绑定字段矛盾时（如“平台级”却绑定了场馆）明确拒绝。
+ * 5. 权威文档校验：不存在、已删除、已禁用。
+ * 6. 内容版本校验：向量 metadata 指纹与权威文档当前指纹比对。
  */
 @Component
 public class KnowledgeEvidenceFilter {
@@ -27,6 +34,8 @@ public class KnowledgeEvidenceFilter {
     public static final String REJECT_DOC_DELETED = "DOC_DELETED";
     public static final String REJECT_DOC_DISABLED = "DOC_DISABLED";
     public static final String REJECT_SCOPE_MISMATCH = "SCOPE_MISMATCH";
+    public static final String REJECT_SCOPE_REQUIRED = "SCOPE_REQUIRED";
+    public static final String REJECT_SCOPE_CONTRADICTION = "SCOPE_CONTRADICTION";
     public static final String REJECT_CONTENT_STALE = "CONTENT_STALE";
     public static final String REJECT_VERSION_UNKNOWN = "VERSION_UNKNOWN";
 
@@ -55,15 +64,16 @@ public class KnowledgeEvidenceFilter {
      * 执行过滤。
      *
      * @param candidates    向量检索候选
-     * @param venueId       请求场馆ID，可为空
-     * @param courtId       请求场地ID，可为空
+     * @param venueId       解析后的场馆ID，可为空
+     * @param courtId       解析后的场地ID，可为空
+     * @param scoped        是否明确了范围（venue/court 任一存在即为 true）
      * @param documents     权威文档快照，key 为 docId
      * @param strictVersion 是否严格校验内容版本
-     * @return 过滤结果
      */
     public FilterOutcome filter(List<ChunkCandidate> candidates,
                                 Long venueId,
                                 Long courtId,
+                                boolean scoped,
                                 Map<Long, KnowledgeDocument> documents,
                                 boolean strictVersion) {
         FilterOutcome outcome = new FilterOutcome();
@@ -71,8 +81,6 @@ public class KnowledgeEvidenceFilter {
         if (candidates == null || candidates.isEmpty()) {
             return outcome;
         }
-
-        boolean scoped = venueId != null || courtId != null;
 
         for (ChunkCandidate candidate : candidates) {
             if (candidate == null || candidate.getDocId() == null) {
@@ -114,9 +122,11 @@ public class KnowledgeEvidenceFilter {
                 continue;
             }
 
-            //适用范围校验。
-            if (scoped && !matchesScope(candidate.getMetadata(), venueId, courtId)) {
-                outcome.rejected.add(new Rejected(candidate, REJECT_SCOPE_MISMATCH));
+            //适用范围校验（基于权威文档字段）。
+            String scopeReason = checkScope(document, venueId, courtId, scoped);
+
+            if (scopeReason != null) {
+                outcome.rejected.add(new Rejected(candidate, scopeReason));
                 continue;
             }
 
@@ -128,63 +138,70 @@ public class KnowledgeEvidenceFilter {
 
     /**
      * 适用范围判定。
-     * 规则与第一轮保持一致并收紧：
-     * 1. 平台级（1）全局适用。
-     * 2. 场馆级（2）必须与当前场馆一致。
-     * 3. 场地级（3）必须与当前场地一致；同时传入场馆时校验归属关系。
-     * 4. 公告级（4）未绑定场馆或绑定当前场馆。
-     * 5. FAQ（5）不等于全局适用，必须未绑定场馆或绑定当前场馆。
-     * 6. 无范围元数据时无法确认适用，指定范围时排除。
+     * 返回 null 表示保留，否则返回拒绝原因。
      */
-    private boolean matchesScope(Map<String, String> metadata, Long venueId, Long courtId) {
-        Long metadataVenueId = parseLong(metadata.get("venueId"));
-        Long metadataCourtId = parseLong(metadata.get("courtId"));
-        Integer scope = parseInteger(metadata.get("knowledgeScope"));
+    private String checkScope(KnowledgeDocument document, Long venueId, Long courtId, boolean scoped) {
+        Integer scope = document.getKnowledgeScope();
+        Long docVenueId = document.getVenueId();
+        Long docCourtId = document.getCourtId();
 
         if (scope == null) {
-            return false;
+            return REJECT_SCOPE_CONTRADICTION;
         }
-
-        boolean hasVenue = venueId != null;
-        boolean hasCourt = courtId != null;
 
         return switch (scope) {
-            case 1 -> true;
-            case 2 -> hasVenue && venueId.equals(metadataVenueId);
-            case 3 -> {
-                //场地级资料必须命中当前场地；同时传入场馆时必须归属同一场馆。
-                if (!hasCourt || !courtId.equals(metadataCourtId)) {
-                    yield false;
+            //平台级：必须没有绑定任何场馆/场地，否则属于资料矛盾。
+            case 1 -> (docVenueId != null || docCourtId != null)
+                    ? REJECT_SCOPE_CONTRADICTION
+                    : null;
+
+            //场馆级：必须绑定场馆，且只在明确该场馆时适用。
+            case 2 -> {
+                if (docVenueId == null) {
+                    yield REJECT_SCOPE_CONTRADICTION;
                 }
-                yield !hasVenue || venueId.equals(metadataVenueId);
+                yield (scoped && venueId != null && venueId.equals(docVenueId))
+                        ? null
+                        : (scoped ? REJECT_SCOPE_MISMATCH : REJECT_SCOPE_REQUIRED);
             }
-            case 4 -> metadataVenueId == null || (hasVenue && venueId.equals(metadataVenueId));
-            case 5 -> metadataVenueId == null || (hasVenue && venueId.equals(metadataVenueId));
-            default -> false;
+
+            //场地级：必须绑定场地，且只在明确该场地时适用；同时校验场馆归属。
+            case 3 -> {
+                if (docCourtId == null) {
+                    yield REJECT_SCOPE_CONTRADICTION;
+                }
+                boolean courtMatch = scoped && courtId != null && courtId.equals(docCourtId);
+                boolean venueMatch = docVenueId == null
+                        || (scoped && venueId != null && venueId.equals(docVenueId));
+                yield (courtMatch && venueMatch)
+                        ? null
+                        : (scoped ? REJECT_SCOPE_MISMATCH : REJECT_SCOPE_REQUIRED);
+            }
+
+            //公告级与 FAQ：绑定限制同样生效。
+            //绑定场地：只对该场地适用，未指定具体场地时不能当作整个场馆的通用规则。
+            //绑定场馆：只对该场馆适用。
+            //完全未绑定：真正全局适用。
+            case 4, 5 -> {
+                if (docCourtId != null) {
+                    boolean courtMatch = scoped && courtId != null && courtId.equals(docCourtId);
+                    boolean venueMatch = docVenueId == null
+                            || (scoped && venueId != null && venueId.equals(docVenueId));
+                    yield (courtMatch && venueMatch)
+                            ? null
+                            : (scoped ? REJECT_SCOPE_MISMATCH : REJECT_SCOPE_REQUIRED);
+                }
+
+                if (docVenueId != null) {
+                    yield (scoped && venueId != null && venueId.equals(docVenueId))
+                            ? null
+                            : (scoped ? REJECT_SCOPE_MISMATCH : REJECT_SCOPE_REQUIRED);
+                }
+
+                yield null;
+            }
+
+            default -> REJECT_SCOPE_CONTRADICTION;
         };
-    }
-
-    private Long parseLong(String value) {
-        if (!StringUtils.hasText(value)) {
-            return null;
-        }
-
-        try {
-            return Long.valueOf(value.trim());
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    private Integer parseInteger(String value) {
-        if (!StringUtils.hasText(value)) {
-            return null;
-        }
-
-        try {
-            return Integer.valueOf(value.trim());
-        } catch (Exception e) {
-            return null;
-        }
     }
 }

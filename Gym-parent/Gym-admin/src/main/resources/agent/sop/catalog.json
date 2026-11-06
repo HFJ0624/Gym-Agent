@@ -1,6 +1,6 @@
 {
-  "version": "1.0.0",
-  "description": "体育场馆智能客服场景 SOP 目录。SOP 只描述处理方法与追问顺序，业务事实（价格、规则、库存）一律来自知识检索或业务工具。",
+  "version": "1.1.0",
+  "description": "体育场馆智能客服场景 SOP 目录。SOP 只描述处理方法与追问顺序，业务事实（价格、规则、库存）一律来自知识检索或业务工具。triggerPatterns 用于识别明确的办理型子请求，纯咨询措辞不应触发办理 SOP。",
   "sops": [
     {
       "name": "knowledge-consult",
@@ -9,6 +9,7 @@
       "applicableIntents": ["RAG_KNOWLEDGE", "VENUE_QUERY", "COURT_QUERY", "SLOT_QUERY", "ORDER_QUERY", "SMALL_TALK"],
       "requiredSlots": [],
       "allowedTools": ["ask_gym_knowledge", "query_venue_list", "query_notice_list"],
+      "triggerPatterns": [],
       "bodyPath": "agent/sop/knowledge-consult.md"
     },
     {
@@ -18,6 +19,7 @@
       "applicableIntents": ["BOOKING_DRAFT"],
       "requiredSlots": ["venueId", "courtId", "bookingDate", "startTime", "endTime"],
       "allowedTools": ["create_booking_draft", "ask_gym_knowledge", "query_venue_list", "query_notice_list"],
+      "triggerPatterns": ["帮我约", "帮我订", "我要约", "我要订", "预约这个", "预订这个", "订这个场", "预约一下这个"],
       "bodyPath": "agent/sop/booking-assist.md"
     },
     {
@@ -27,6 +29,7 @@
       "applicableIntents": ["BOOKING_CANCEL"],
       "requiredSlots": ["bookingId"],
       "allowedTools": ["query_cancelable_booking", "create_cancel_booking_draft", "ask_gym_knowledge"],
+      "triggerPatterns": ["帮我取消", "取消我的", "我要取消", "给我取消", "可取消预约", "取消刚才", "取消那一笔", "取消那一单"],
       "bodyPath": "agent/sop/cancel-assist.md"
     },
     {
@@ -36,7 +39,9 @@
       "applicableIntents": ["SHOPPING_QUERY"],
       "requiredSlots": ["productName"],
       "allowedTools": ["create_shopping_draft", "ask_gym_knowledge"],
+      "triggerPatterns": ["帮我买", "我要买", "给我买", "买一瓶", "买两瓶", "买三瓶", "买点", "来一瓶", "来两瓶", "下单买"],
       "bodyPath": "agent/sop/shopping-assist.md"
     }
   ]
 }
+

@@ -164,6 +164,8 @@ public class OpenAiCompatibleLlmClient implements LlmClient {
     /**
      * 计算本次请求超时。
      * 上层传入的剩余预算更小的时候以预算为准，避免等待超过本轮截止时间。
+     * 剩余预算不足 1 秒时不强行扩大为 1 秒（否则会突破截止时间），
+     * 仅保留 1 毫秒下限以满足 HttpClient 参数要求。
      */
     private long resolveTimeoutMs(Integer requestedTimeoutMs) {
         int configured = properties.getRequestTimeoutMs() > 0 ? properties.getRequestTimeoutMs() : 45000;
@@ -174,8 +176,7 @@ public class OpenAiCompatibleLlmClient implements LlmClient {
             timeout = Math.min(configured, requestedTimeoutMs);
         }
 
-        //至少保留 1 秒，避免极端情况下传 0 或负数导致请求必然失败。
-        return Math.max(timeout, 1000L);
+        return Math.max(timeout, 1L);
     }
 
     /**

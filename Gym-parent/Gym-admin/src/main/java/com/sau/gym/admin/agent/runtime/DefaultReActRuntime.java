@@ -134,9 +134,9 @@ public class DefaultReActRuntime implements ReActRuntime {
         produced.add(userMessage);
 
         List<LlmToolDefinition> tools = schemaBuilder.build(runContext.getAllowedToolCodes());
+        //系统提示与工具 Schema 属于固定开销；摘要开销由预算器按当前摘要实时计算。
         int fixedTokenOverhead = estimateToolSchemaTokens(tools)
-                + TokenEstimator.estimate(runContext.getSystemPrompt())
-                + TokenEstimator.estimate(runContext.getSummary());
+                + TokenEstimator.estimate(runContext.getSystemPrompt());
 
         int attempt = 0;
         int repeatTerminations = 0;
@@ -169,6 +169,13 @@ public class DefaultReActRuntime implements ReActRuntime {
                 LlmChatResponse response = modelChain.proceed(modelRequest);
 
                 List<LlmToolCall> toolCalls = normalizeToolCalls(response.toolCalls());
+
+                //模型返回后再次检查锁租约：锁在模型调用期间丢失时不得继续派发工具，
+                //避免旧请求覆盖新请求写入的会话状态。
+                if (!toolCalls.isEmpty() && !runContext.canContinue()) {
+                    return budgetExceeded(runContext, produced, start, "LOCK_LOST",
+                            "会话锁在处理期间失效，已停止后续工具调用，部分操作未完成。");
+                }
 
                 //保存模型实际返回的 assistant 消息，content 与 tool_calls 同时保留。
                 SessionMessage assistantMessage = SessionMessage.assistant(response.content(), toolCalls);
