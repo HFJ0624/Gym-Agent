@@ -190,7 +190,8 @@ public class GymBookingTools {
      * @param confirmToken 确认码
      * @return 真正确认预约
      */
-    public String confirmPendingBooking(Long userId, String sessionId, String confirmToken) {
+    public String confirmPendingBooking(Long userId, String sessionId, String confirmToken,
+                                        com.sau.gym.admin.agent.store.SessionWriteTicket ticket) {
         PendingDraft draft = draftStore.get(userId, sessionId);
         if (draft == null || draft.type() != PendingDraftType.BOOKING) {
             return "当前没有待确认的预约草稿。";
@@ -230,7 +231,12 @@ public class GymBookingTools {
             courtBookingService.saveCourtBook(bookingDto);
 
             // 成功后清除草稿
-            draftStore.clear(userId, sessionId);
+            //受保护清理：确认成功后仅清除本人当前会话草稿，失锁请求不得误删新草稿。
+            com.sau.gym.admin.agent.store.SessionWriteResult clearResult =
+                    draftStore.clearIfHolder(userId, sessionId, ticket);
+            if (clearResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+                return "预约已提交，但清理本地草稿未获授权，重复确认会由业务校验拦截。";
+            }
 
             return "预约成功：\n"
                     + "场馆：" + venueName + "\n"

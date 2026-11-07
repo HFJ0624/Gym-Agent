@@ -81,6 +81,12 @@ public class AgentToolExecuteContext implements Serializable {
     private transient EvidenceRegistry evidenceRegistry;
 
     /**
+     * 会话受保护写入凭证（来自真实锁句柄）。
+     * 草稿类工具用它做 Redis 原子校验写入，失锁后不再覆盖新状态。
+     */
+    private transient com.sau.gym.admin.agent.store.SessionWriteTicket writeTicket;
+
+    /**
      * 工具入参。
      */
     private Map<String, Object> params = new HashMap<>();

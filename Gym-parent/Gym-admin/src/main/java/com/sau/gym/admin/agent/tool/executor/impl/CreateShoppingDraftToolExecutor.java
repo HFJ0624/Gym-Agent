@@ -151,7 +151,8 @@ public class CreateShoppingDraftToolExecutor extends AbstractGymAgentToolExecuto
         String confirmToken = AgentConfirmTokenUtil.generateToken();
 
         // 保存商品下单草稿到 Redis，按 userId + sessionId 隔离。
-        draftStore.save(
+        // 受保护写入：Redis 原子校验锁令牌，失锁后不得覆盖新状态。
+        com.sau.gym.admin.agent.store.SessionWriteResult writeResult = draftStore.saveIfHolder(
                 userId,
                 context.getSessionId(),
                 new PendingDraft(
@@ -159,8 +160,18 @@ public class CreateShoppingDraftToolExecutor extends AbstractGymAgentToolExecuto
                         data,
                         LocalDateTime.now(),
                         confirmToken
-                )
+                ),
+                context.getWriteTicket()
         );
+
+        if (writeResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+            return AgentToolExecuteResult.failed(
+                    writeResult == com.sau.gym.admin.agent.store.SessionWriteResult.LOCK_LOST
+                            ? "会话状态已变更，本轮下单草稿未保存。请重新发起购买，不要重复确认。"
+                            : "会话存储暂时不可用，下单草稿未保存。请稍后再试。",
+                    "DRAFT_WRITE_" + writeResult.name()
+            );
+        }
 
         BigDecimal total = beverage.getPrice().multiply(BigDecimal.valueOf(quantity));
 

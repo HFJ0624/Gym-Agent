@@ -29,14 +29,21 @@ public class AgentDraftStore {
     private final RedisTemplate<String, PendingDraft> redisTemplate;
 
     /**
+     * 受保护写入：Redis 侧原子校验锁令牌后再写入/删除。
+     */
+    private final SessionProtectedRedis protectedRedis;
+
+    /**
      * 草稿过期时间，单位：分钟。
      * 默认 15 分钟。
      */
     @Value("${gym.agent.draft.ttl-minutes:15}")
     private Long ttlMinutes;
 
-    public AgentDraftStore(RedisTemplate<String, PendingDraft> agentDraftRedisTemplate) {
+    public AgentDraftStore(RedisTemplate<String, PendingDraft> agentDraftRedisTemplate,
+                           SessionProtectedRedis protectedRedis) {
         this.redisTemplate = agentDraftRedisTemplate;
+        this.protectedRedis = protectedRedis;
     }
 
     /**
@@ -63,6 +70,62 @@ public class AgentDraftStore {
         if (AgentSessionIdUtil.isDefault(realSessionId)) {
             redisTemplate.delete(buildLegacyKey(userId));
         }
+    }
+
+    /**
+     * 持有者保护的草稿保存。
+     * Redis 原子校验锁令牌后写入，旧请求在失锁后无法覆盖新持有者的草稿。
+     * 值序列化复用模板自身的 valueSerializer（JDK 字节），与普通读写完全兼容。
+     *
+     * @return 写入结果；非 SAVED 时调用方必须如实告知草稿未保存
+     */
+    public SessionWriteResult saveIfHolder(Long userId, String sessionId, PendingDraft draft,
+                                           SessionWriteTicket ticket) {
+        if (userId == null || draft == null) {
+            return SessionWriteResult.SAVED;
+        }
+
+        if (ticket == null) {
+            //Agent 主链必须携带令牌；无令牌的调用走 legacy save 且不属于受保护路径。
+            return SessionWriteResult.LOCK_LOST;
+        }
+
+        @SuppressWarnings("unchecked")
+        org.springframework.data.redis.serializer.RedisSerializer<Object> serializer =
+                (org.springframework.data.redis.serializer.RedisSerializer<Object>) redisTemplate.getValueSerializer();
+
+        byte[] rawValue = serializer.serialize(draft);
+
+        return protectedRedis.writeIfHolder(
+                redisTemplate,
+                ticket.lockKey(),
+                ticket.token(),
+                buildKey(userId, AgentSessionIdUtil.normalize(sessionId)),
+                rawValue,
+                Duration.ofMinutes(resolveTtlMinutes())
+        );
+    }
+
+    /**
+     * 持有者保护的草稿删除。
+     *
+     * @return 写入结果
+     */
+    public SessionWriteResult clearIfHolder(Long userId, String sessionId, SessionWriteTicket ticket) {
+        if (userId == null) {
+            return SessionWriteResult.SAVED;
+        }
+
+        if (ticket == null) {
+            return SessionWriteResult.LOCK_LOST;
+        }
+
+        return protectedRedis.deleteIfHolder(
+                redisTemplate,
+                ticket.lockKey(),
+                ticket.token(),
+                buildKey(userId, AgentSessionIdUtil.normalize(sessionId))
+        );
     }
 
     /**

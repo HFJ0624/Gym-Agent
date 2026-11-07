@@ -73,6 +73,8 @@ class AgentHarnessCommitGuardTest {
                 mock(AgentTraceService.class),
                 mock(AgentDraftStore.class),
                 mock(AgentSopCatalog.class),
+                mock(com.sau.gym.admin.agent.run.AgentRunStore.class),
+                mock(com.sau.gym.admin.agent.snapshot.AgentResponseAssembler.class),
                 new ObjectMapper()
         );
 
@@ -80,6 +82,8 @@ class AgentHarnessCommitGuardTest {
 
         session = new DefaultGymAgentHarness.RunSession();
         session.lockHandle = lock;
+        session.writeTicket = com.sau.gym.admin.agent.store.SessionWriteTicket.of(
+                "agent:session:lock:user:1:session:session-a", "test-token");
         session.pendingHistory = new SessionHistory();
         session.pendingHistory.setMessages(List.of(
                 SessionMessage.user("旧请求消息"),
@@ -101,12 +105,15 @@ class AgentHarnessCommitGuardTest {
     @Test
     void 锁有效时应正常提交会话历史() {
         when(lock.isLeaseValid()).thenReturn(true);
-        when(messageStore.saveHistory(any(), anyString(), any())).thenReturn(true);
+        when(messageStore.saveHistoryIfHolder(any(), anyString(), any(),
+                any(com.sau.gym.admin.agent.store.SessionWriteTicket.class)))
+                .thenReturn(com.sau.gym.admin.agent.store.SessionWriteResult.SAVED);
 
         boolean committed = harness.commitSessionHistory(1L, "session-a", session,
                 AgentRunResult.completed("回复"));
 
         assertTrue(committed);
-        verify(messageStore).saveHistory(1L, "session-a", session.pendingHistory);
+        verify(messageStore).saveHistoryIfHolder(1L, "session-a", session.pendingHistory, session.writeTicket);
+        verify(messageStore, never()).saveHistory(any(), anyString(), any());
     }
 }

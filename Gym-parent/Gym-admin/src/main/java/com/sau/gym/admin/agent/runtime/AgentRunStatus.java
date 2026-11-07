@@ -9,6 +9,11 @@ package com.sau.gym.admin.agent.runtime;
 public enum AgentRunStatus {
 
     /**
+     * 运行中（尚未产生终态）。
+     */
+    RUNNING,
+
+    /**
      * 正常得到最终回答。
      */
     COMPLETED,
@@ -31,5 +36,11 @@ public enum AgentRunStatus {
     /**
      * 轮数、工具次数、上下文或耗时预算耗尽。
      */
-    BUDGET_EXCEEDED
+    BUDGET_EXCEEDED,
+
+    /**
+     * 运行被中断：进程在产生终态前退出，且原持有者租约已失效。
+     * 由运行存储在查询时按条件写识别，不代表业务结果，结果需重新核实。
+     */
+    INTERRUPTED
 }

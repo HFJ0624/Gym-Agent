@@ -151,6 +151,14 @@ public class AgentSessionLockService {
         }
 
         /**
+         * 生成受保护写入凭证。
+         * 令牌只在服务端执行上下文中流转，用于 Redis 原子脚本校验。
+         */
+        public SessionWriteTicket toTicket() {
+            return SessionWriteTicket.of(key, token);
+        }
+
+        /**
          * 执行一次续租（调度器与测试共用）。
          *
          * @return true=续租成功（延长租约）；false=锁已不属于自己（明确失效）

@@ -242,7 +242,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick, computed } from 'vue'
+import { ref, nextTick, computed, watch, onUnmounted } from 'vue'
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import { useAuth } from '@/stores/auth'
@@ -478,6 +478,12 @@ const sendMessage = async text => {
       : null
 
     if (payload) {
+      //SESSION_BUSY：当前会话仍在处理上一条，保留现有状态，不覆盖。
+      if (payload.errorCode === 'SESSION_BUSY') {
+        ElMessage.info(payload.message || '当前会话正在处理上一条消息，请稍后再试。')
+        return
+      }
+
       const draft = payload.cards && payload.cards.length
         ? buildDraftFromCard(payload.cards[0])
         : null
@@ -485,6 +491,7 @@ const sendMessage = async text => {
       messages.value.push({
         role: 'ai',
         content: payload.message || '',
+        turnId: payload.runId || null,
         draft,
         actions: null,
         actionButtons: payload.actions || [],
@@ -493,6 +500,33 @@ const sendMessage = async text => {
         sources: payload.sources || []
       })
 
+      //给本轮未标记的用户消息打上稳定标识，用于与恢复结果去重合并。
+      for (let i = messages.value.length - 1; i >= 0; i--) {
+        const m = messages.value[i]
+        if (m.role === 'user' && !m.turnId) {
+          m.turnId = payload.runId || null
+        }
+        if (m.role === 'user' && m.turnId) {
+          break
+        }
+      }
+
+      //会话保存失败：保留响应但明确提示可能无法刷新恢复；这不是业务失败。
+      if (payload.sessionCommitted === false) {
+        messages.value.push({
+          role: 'ai',
+          content: '（提示：本轮对话保存失败，刷新页面后可能无法恢复这段内容。）',
+          turnId: null,
+          draft: null,
+          actions: null,
+          actionButtons: null,
+          actionUsed: true,
+          actionLoading: false,
+          sources: []
+        })
+      }
+
+      scrollToBottom()
       return
     }
 
@@ -512,12 +546,68 @@ const sendMessage = async text => {
       sources: []
     })
   } catch (e) {
-    ElMessage.error('连接 AI 服务失败')
     console.error(e)
 
+    //超时/断连后先查询会话状态，不自动重新 POST 原消息或确认指令。
+    const lastUser = messages.value.filter(m => m.role === 'user').pop()
+
+    if (userId.value) {
+      try {
+        const { data } = await axios.get(
+          `http://localhost:9601/front/agent/sessions/${sessionId.value}`,
+          {
+            headers: authStore.token ? { token: authStore.token } : {},
+            timeout: 15000
+          }
+        )
+
+        const payload = data && data.data ? data.data : null
+        const run = payload && payload.run
+
+        //本轮已完成或待确认：展示已保存结果，不重发请求。
+        if (payload && lastUser && payload.turns
+            && payload.turns.some(t => lastUser.content && t.userText === lastUser.content)) {
+          mergeSnapshotTurns(payload)
+          mergeSnapshotTodo(payload)
+          handleRunStatus(payload, 'reconnect')
+          return
+        }
+
+        //仍在处理中：有界轮询。
+        if (run && run.status === 'RUNNING') {
+          ElMessage.info('请求仍在处理中，正在为你查询结果…')
+          startPolling()
+          return
+        }
+
+        //已中断：按阶段提示，不自动重放确认。
+        if (run && run.status === 'INTERRUPTED') {
+          const tip = run.stage === 'CONFIRMING' || run.stage === 'FINISHING'
+            ? '办理请求被中断且结果不确定，请先在订单/预约页核实后再操作。'
+            : '请求已中断，请重新提问即可。'
+          messages.value.push({
+            role: 'ai',
+            content: tip,
+            turnId: null,
+            draft: null,
+            actions: null,
+            actionButtons: null,
+            actionUsed: true,
+            actionLoading: false,
+            sources: []
+          })
+          return
+        }
+      } catch (queryError) {
+        console.warn('[AiAssistant] 状态查询失败', queryError)
+      }
+    }
+
+    ElMessage.error('连接 AI 服务失败')
     messages.value.push({
       role: 'ai',
       content: 'AI服务暂时不可用，请稍后再试。',
+      turnId: null,
       draft: null,
       actions: null,
       actionButtons: null,
@@ -1428,6 +1518,290 @@ function scrollToBottom() {
     }
   })
 }
+
+/**
+ * ==================== 第三轮：会话恢复与状态查询 ====================
+ */
+
+/**
+ * 恢复请求令牌：账号切换或重新恢复时递增，
+ * 晚到的旧恢复响应按令牌丢弃，防止覆盖当前用户的界面。
+ */
+let restoreToken = 0
+
+/**
+ * 有界轮询句柄。
+ */
+let pollTimer = null
+
+let pollCount = 0
+
+/**
+ * 退出登录或切换账号时清空本地展示与待办。
+ */
+function resetLocalSession() {
+  restoreToken++
+  stopPolling()
+  messages.value = [buildWelcomeMessage()]
+}
+
+function buildWelcomeMessage() {
+  return {
+    role: 'ai',
+    content: '你好！我是体育场馆AI客服，有什么可以帮你？',
+    draft: null,
+    actions: null,
+    actionButtons: null,
+    actionUsed: false,
+    actionLoading: false,
+    sources: []
+  }
+}
+
+/**
+ * 会话恢复：拉取最近展示对话、运行状态与当前有效草稿。
+ * 只读接口，模型调用次数为 0。
+ */
+async function restoreSession(reason) {
+  if (!userId.value) {
+    return
+  }
+
+  const token = ++restoreToken
+
+  try {
+    const { data } = await axios.get(
+      `http://localhost:9601/front/agent/sessions/${sessionId.value}`,
+      {
+        headers: authStore.token ? { token: authStore.token } : {},
+        timeout: 15000
+      }
+    )
+
+    //异步竞态：响应返回时身份或会话已变化则丢弃。
+    if (token !== restoreToken || !userId.value) {
+      return
+    }
+
+    const payload = data && data.data ? data.data : null
+
+    if (!payload) {
+      return
+    }
+
+    if (payload.loadFailed) {
+      ElMessage.warning('会话状态暂时不可用，可能不是最新内容。')
+    }
+
+    mergeSnapshotTurns(payload)
+
+    mergeSnapshotTodo(payload)
+
+    handleRunStatus(payload, reason)
+  } catch (e) {
+    //恢复失败静默降级：保留现有欢迎语或本地消息。
+    console.warn('[AiAssistant] 会话恢复失败', e)
+  }
+}
+
+/**
+ * 按 turnId 合并历史展示轮次，避免重复追加同一批历史。
+ */
+function mergeSnapshotTurns(payload) {
+  const turns = payload.turns || []
+
+  for (const turn of turns) {
+    const exists = messages.value.some(m => m.turnId === turn.turnId)
+
+    if (exists) {
+      continue
+    }
+
+    messages.value.push({
+      role: 'user',
+      content: turn.userText || '',
+      turnId: turn.turnId,
+      draft: null,
+      actions: null,
+      actionButtons: null,
+      actionUsed: false,
+      actionLoading: false,
+      sources: []
+    })
+
+    messages.value.push({
+      role: 'ai',
+      content: turn.replyText || '',
+      turnId: turn.turnId,
+      draft: null,
+      actions: null,
+      actionButtons: null,
+      actionUsed: true,
+      actionLoading: false,
+      sources: turn.sources || []
+    })
+  }
+
+  scrollToBottom()
+}
+
+/**
+ * 合并当前有效待办：卡片与按钮来自服务端实时读取的真实草稿。
+ */
+function mergeSnapshotTodo(payload) {
+  const hasTodo = payload.cards && payload.cards.length
+
+  if (!hasTodo) {
+    return
+  }
+
+  const alreadyShown = messages.value.some(
+    m => m.role === 'ai' && m.draft && m.draft.confirmToken
+      && payload.cards.some(c => c.confirmToken === m.draft.confirmToken)
+  )
+
+  if (alreadyShown) {
+    return
+  }
+
+  const draft = payload.cards[0] ? buildDraftFromCard(payload.cards[0]) : null
+
+  messages.value.push({
+    role: 'ai',
+    content: '你当前有一个待确认操作：',
+    turnId: null,
+    draft,
+    actions: null,
+    actionButtons: payload.actions || [],
+    actionUsed: false,
+    actionLoading: false,
+    sources: []
+  })
+}
+
+/**
+ * 处理运行状态提示。
+ */
+function handleRunStatus(payload, reason) {
+  const run = payload.run
+
+  if (!run || !run.status) {
+    return
+  }
+
+  if (run.status === 'RUNNING') {
+    messages.value.push({
+      role: 'ai',
+      content: '上一条请求仍在处理中，正在为你查询结果…',
+      turnId: null,
+      draft: null,
+      actions: null,
+      actionButtons: null,
+      actionUsed: true,
+      actionLoading: false,
+      sources: []
+    })
+
+    startPolling()
+
+    return
+  }
+
+  if (run.status === 'INTERRUPTED') {
+    //已进入确认阶段而结果不明时，引导核实而不是自动重放。
+    const tip = run.stage === 'CONFIRMING' || run.stage === 'FINISHING'
+      ? '上一条办理请求被中断且结果不确定，请先在订单/预约页核实后再操作。'
+      : '上一条请求已中断，请重新提问即可。'
+
+    messages.value.push({
+      role: 'ai',
+      content: tip,
+      turnId: null,
+      draft: null,
+      actions: null,
+      actionButtons: null,
+      actionUsed: true,
+      actionLoading: false,
+      sources: []
+    })
+  }
+
+  if (reason === 'reconnect') {
+    ElMessage.info('连接已恢复，已为你显示最近会话状态。')
+  }
+}
+
+/**
+ * 有界轮询运行状态：组件身份变化或超次后停止，不创建新的 Agent 执行。
+ */
+function startPolling() {
+  stopPolling()
+  pollCount = 0
+
+  pollTimer = setInterval(async () => {
+    pollCount++
+
+    const token = restoreToken
+
+    if (pollCount > 3) {
+      stopPolling()
+      return
+    }
+
+    try {
+      const { data } = await axios.get(
+        `http://localhost:9601/front/agent/sessions/${sessionId.value}`,
+        {
+          headers: authStore.token ? { token: authStore.token } : {},
+          timeout: 15000
+        }
+      )
+
+      if (token !== restoreToken) {
+        stopPolling()
+        return
+      }
+
+      const payload = data && data.data ? data.data : null
+      const run = payload && payload.run
+
+      if (!run || run.status !== 'RUNNING') {
+        stopPolling()
+        mergeSnapshotTurns(payload || {})
+        mergeSnapshotTodo(payload || {})
+      }
+    } catch (e) {
+      //查询失败继续下一轮，超过次数后停止。
+    }
+  }, 3000)
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+/**
+ * 登录用户首次打开或身份变化时恢复会话。
+ */
+watch(
+  () => userId.value,
+  (newId, oldId) => {
+    //账号切换/退出：立即清空，防止前一用户的对话或按钮残留。
+    resetLocalSession()
+
+    if (newId) {
+      restoreSession('init')
+    }
+  },
+  { immediate: true }
+)
+
+onUnmounted(() => {
+  stopPolling()
+})
 </script>
 
 <style scoped>

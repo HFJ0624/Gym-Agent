@@ -5,6 +5,7 @@ import com.sau.gym.admin.agent.model.AgentDraftCreationResult;
 import com.sau.gym.admin.agent.service.AgentCancelBookingService;
 import com.sau.gym.admin.agent.store.AgentDraftStore;
 import com.sau.gym.admin.agent.store.PendingDraft;
+import com.sau.gym.admin.agent.store.SessionWriteTicket;
 import com.sau.gym.admin.enums.PendingDraftType;
 import com.sau.gym.admin.agent.util.AgentConfirmTokenUtil;
 import com.sau.gym.admin.mapper.BookingRefundRequestMapper;
@@ -109,7 +110,8 @@ public class AgentCancelBookingServiceImpl implements AgentCancelBookingService 
      * 生成取消预约草稿。
      */
     @Override
-    public AgentDraftCreationResult createCancelBookingDraft(Long userId, String sessionId, Long bookingId, String reason) {
+    public AgentDraftCreationResult createCancelBookingDraft(Long userId, String sessionId, Long bookingId,
+                                                           String reason, SessionWriteTicket ticket) {
         if (userId == null) {
             return new AgentDraftCreationResult("请先登录后再取消预约。", null);
         }
@@ -155,12 +157,26 @@ public class AgentCancelBookingServiceImpl implements AgentCancelBookingService 
         data.put("needRefund", needRefund);
 
         //保存取消预约草稿到 Redis。用户必须带确认码确认后，才会真正取消预约。
-        draftStore.save(userId, sessionId, new PendingDraft(
-                PendingDraftType.CANCEL_BOOKING,
-                data,
-                LocalDateTime.now(),
-                confirmToken
-        ));
+        //受保护写入：失锁或存储不可用时草稿不落库，调用方拿到的是明确的失败文案。
+        com.sau.gym.admin.agent.store.SessionWriteResult writeResult = draftStore.saveIfHolder(
+                userId,
+                sessionId,
+                new PendingDraft(
+                        PendingDraftType.CANCEL_BOOKING,
+                        data,
+                        LocalDateTime.now(),
+                        confirmToken
+                ),
+                ticket);
+
+        if (writeResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+            return new AgentDraftCreationResult(
+                    writeResult == com.sau.gym.admin.agent.store.SessionWriteResult.LOCK_LOST
+                            ? "会话状态已变更，本轮取消草稿未保存。请重新发起取消，不要重复确认。"
+                            : "会话存储暂时不可用，取消草稿未保存。请稍后再试。",
+                    null
+            );
+        }
 
         String text = "已为你生成取消预约草稿：\n"
                 + "预约ID：" + booking.getBookingId() + "\n"
@@ -189,7 +205,7 @@ public class AgentCancelBookingServiceImpl implements AgentCancelBookingService 
      */
     @Transactional(rollbackFor = Exception.class)
     @Override
-    public String confirmCancelBooking(Long userId, String sessionId, String confirmToken) {
+    public String confirmCancelBooking(Long userId, String sessionId, String confirmToken, SessionWriteTicket ticket) {
         if (userId == null) {
             return "请先登录后再确认取消预约。";
         }

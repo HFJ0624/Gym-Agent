@@ -107,7 +107,8 @@ public class CreateCancelBookingDraftToolExecutor extends AbstractGymAgentToolEx
                 userId,
                 context.getSessionId(),
                 bookingId,
-                reason
+                reason,
+                context.getWriteTicket()
         );
 
         //草稿创建失败时不能返回 NEED_CONFIRM，否则前端会展示一张无效卡片。

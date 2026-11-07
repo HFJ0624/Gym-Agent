@@ -53,7 +53,8 @@ public class AgentContextEnhanceServiceImpl implements AgentContextEnhanceServic
      * 6. 保存回 Redis
      */
     @Override
-    public AgentBusinessContext prepareBeforeAgent(Long userId, String sessionId, String message, AgentChatDto dto) {
+    public AgentBusinessContext prepareBeforeAgent(Long userId, String sessionId, String message, AgentChatDto dto,
+                                                   com.sau.gym.admin.agent.store.SessionWriteTicket ticket) {
         if (userId == null) {
             return null;
         }
@@ -121,6 +122,16 @@ public class AgentContextEnhanceServiceImpl implements AgentContextEnhanceServic
         context.setLastIntent(guessIntent(message));
 
         // 保存上下文到 Redis
+        //持有者保护：旧请求失锁后不得覆盖新持有者的业务槽位。
+        //保存被拒绝时本轮仍返回内存中的上下文供当次使用，但槽位未持久化。
+        if (ticket != null) {
+            com.sau.gym.admin.agent.store.SessionWriteResult result = contextStore.saveIfHolder(context, ticket);
+            if (result != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+                System.out.println("[AgentContext] 业务槽位保存被条件写拒绝: " + result);
+            }
+            return context;
+        }
+
         contextStore.save(context);
 
         return context;
@@ -145,7 +156,7 @@ public class AgentContextEnhanceServiceImpl implements AgentContextEnhanceServic
      * 这些信息比用户原始文本更准确，所以要反写到上下文里。
      */
     @Override
-    public void refreshAfterAgent(Long userId, String sessionId) {
+    public void refreshAfterAgent(Long userId, String sessionId, com.sau.gym.admin.agent.store.SessionWriteTicket ticket) {
         if (userId == null) {
             return;
         }
@@ -223,6 +234,12 @@ public class AgentContextEnhanceServiceImpl implements AgentContextEnhanceServic
 
         context.setLastIntent("BOOKING_CREATE");
         context.setUpdatedAt(LocalDateTime.now());
+
+        //持有者保护：旧请求失锁后不得覆盖新持有者的业务槽位。
+        if (ticket != null) {
+            contextStore.saveIfHolder(context, ticket);
+            return;
+        }
 
         contextStore.save(context);
     }

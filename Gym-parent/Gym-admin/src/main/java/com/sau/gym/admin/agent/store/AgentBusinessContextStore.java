@@ -36,10 +36,17 @@ public class AgentBusinessContextStore {
 
     private final ObjectMapper objectMapper;
 
+    /**
+     * 持有者保护写入（Redis 原子校验锁令牌）。
+     */
+    private final SessionProtectedRedis protectedRedis;
+
     public AgentBusinessContextStore(StringRedisTemplate stringRedisTemplate,
-                                     ObjectMapper objectMapper) {
+                                     ObjectMapper objectMapper,
+                                     SessionProtectedRedis protectedRedis) {
         this.stringRedisTemplate = stringRedisTemplate;
         this.objectMapper = objectMapper;
+        this.protectedRedis = protectedRedis;
     }
 
     /**
@@ -108,6 +115,41 @@ public class AgentBusinessContextStore {
         } catch (Exception e) {
             //保存上下文失败不影响聊天主流程，但需要留下可观察日志。
             System.out.println("[AgentContext] 保存业务上下文失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 持有者保护的业务上下文保存。
+     * Redis 原子校验锁令牌后写入，旧请求在失锁后无法覆盖新持有者的槽位。
+     *
+     * @return 写入结果；非 SAVED 时调用方需知悉槽位未更新
+     */
+    public SessionWriteResult saveIfHolder(AgentBusinessContext context, SessionWriteTicket ticket) {
+        if (context == null || context.getUserId() == null) {
+            return SessionWriteResult.SAVED;
+        }
+
+        if (ticket == null) {
+            //Agent 主链必须携带令牌。
+            return SessionWriteResult.LOCK_LOST;
+        }
+
+        String realSessionId = AgentSessionIdUtil.normalize(context.getSessionId());
+        context.setSessionId(realSessionId);
+
+        try {
+            String json = objectMapper.writeValueAsString(context);
+
+            return protectedRedis.writeIfHolder(
+                    ticket.lockKey(),
+                    ticket.token(),
+                    buildKey(context.getUserId(), realSessionId),
+                    json,
+                    TTL
+            );
+        } catch (Exception e) {
+            System.out.println("[AgentContext] 受保护保存业务上下文失败：" + e.getMessage());
+            return SessionWriteResult.STORE_UNAVAILABLE;
         }
     }
 

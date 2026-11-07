@@ -60,4 +60,16 @@ public class AgentChatResponse {
      *       {"type":"cancel","label":"取消","command":"取消"}
      */
     private List<Map<String, Object>> actions = new ArrayList<>();
+
+    /**
+     * 业务/执行错误码（可选）：例如 SESSION_BUSY、LOCK_LOST、DRAFT_WRITE_LOCK_LOST。
+     * 有值时 message 仍为用户可读文字。
+     */
+    private String errorCode;
+
+    /**
+     * 会话历史是否成功提交（可选）。
+     * false 时前端应提示本次回复可能无法通过刷新恢复。
+     */
+    private Boolean sessionCommitted;
 }

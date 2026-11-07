@@ -471,6 +471,7 @@ public class DefaultReActRuntime implements ReActRuntime {
         executeContext.setOriginalQuestion(runContext.getOriginalQuestion());
         executeContext.setBusinessContext(runContext.getBusinessContext());
         executeContext.setEvidenceRegistry(runContext.getEvidenceRegistry());
+        executeContext.setWriteTicket(runContext.getWriteTicket());
         executeContext.setRemainingBudgetMs(runContext.remainingTimeMs());
         executeContext.setParams(request.getArguments() == null
                 ? new LinkedHashMap<>()
@@ -644,6 +645,23 @@ public class DefaultReActRuntime implements ReActRuntime {
     }
 
     /**
+     * 统一的最终回复写入入口：
+     * 最终 assistant 回复同时进入 runContext.messages（Harness 提交的会话快照）
+     * 与 produced（本结果新增消息），保证返回文字、下一轮模型可见消息与展示快照一致，
+     * 且用户消息与最终回复都只出现一次。
+     */
+    private SessionMessage appendFinalReply(AgentRunContext runContext,
+                                            List<SessionMessage> produced,
+                                            String replyText) {
+        SessionMessage reply = SessionMessage.assistant(replyText);
+
+        runContext.addMessage(reply);
+        produced.add(reply);
+
+        return reply;
+    }
+
+    /**
      * 失败终态。
      * 补一条 assistant 消息，保证会话历史不会留下没有回复的用户消息。
      */
@@ -653,7 +671,7 @@ public class DefaultReActRuntime implements ReActRuntime {
                                   String replyText,
                                   String errorCode) {
         AgentRunResult result = AgentRunResult.failed(replyText, errorCode);
-        produced.add(SessionMessage.assistant(replyText));
+        appendFinalReply(runContext, produced, replyText);
         fill(result, runContext, produced, start);
         return result;
     }
@@ -667,7 +685,7 @@ public class DefaultReActRuntime implements ReActRuntime {
                                           String errorCode,
                                           String replyText) {
         AgentRunResult result = AgentRunResult.budgetExceeded(replyText, errorCode);
-        produced.add(SessionMessage.assistant(replyText));
+        appendFinalReply(runContext, produced, replyText);
         fill(result, runContext, produced, start);
         return result;
     }
@@ -675,6 +693,7 @@ public class DefaultReActRuntime implements ReActRuntime {
     /**
      * 待确认终态。
      * 展示内容必须来自后端工具结果，不能由模型重新生成。
+     * 草稿文案同时写入协议历史，保证本轮“用户可见的最终文字”进入真实会话快照。
      */
     private AgentRunResult waitingConfirmation(AgentRunContext runContext,
                                                List<SessionMessage> produced,
@@ -693,6 +712,8 @@ public class DefaultReActRuntime implements ReActRuntime {
                 payload,
                 confirmResult.getConfirmAction()
         );
+
+        appendFinalReply(runContext, produced, confirmResult.getMessage());
 
         fill(result, runContext, produced, start);
         return result;

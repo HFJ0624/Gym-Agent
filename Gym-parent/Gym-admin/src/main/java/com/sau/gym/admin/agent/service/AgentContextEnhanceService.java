@@ -19,7 +19,8 @@ public interface AgentContextEnhanceService {
      * @param dto       前端传入的 Agent 请求参数
      * @return 更新后的业务上下文
      */
-    AgentBusinessContext prepareBeforeAgent(Long userId, String sessionId, String message, AgentChatDto dto);
+    AgentBusinessContext prepareBeforeAgent(Long userId, String sessionId, String message, AgentChatDto dto,
+                                            com.sau.gym.admin.agent.store.SessionWriteTicket ticket);
 
     /**
      * 在 Agent 调用完成后刷新业务上下文。
@@ -32,7 +33,7 @@ public interface AgentContextEnhanceService {
      * @param userId    用户ID
      * @param sessionId 会话ID
      */
-    void refreshAfterAgent(Long userId, String sessionId);
+    void refreshAfterAgent(Long userId, String sessionId, com.sau.gym.admin.agent.store.SessionWriteTicket ticket);
 
     /**
      * 构造传给大模型的上下文提示词。

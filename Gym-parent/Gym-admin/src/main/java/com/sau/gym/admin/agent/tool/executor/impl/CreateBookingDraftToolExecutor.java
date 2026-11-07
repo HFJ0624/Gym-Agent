@@ -327,7 +327,8 @@ public class CreateBookingDraftToolExecutor extends AbstractGymAgentToolExecutor
         String confirmToken = AgentConfirmTokenUtil.generateToken();
 
         //16. 保存预约草稿到 Redis，按 userId + sessionId 隔离。
-        draftStore.save(
+        //受保护写入：Redis 原子校验锁令牌，失锁后不得覆盖新状态，也不得宣称草稿已生成。
+        com.sau.gym.admin.agent.store.SessionWriteResult writeResult = draftStore.saveIfHolder(
                 userId,
                 context.getSessionId(),
                 new PendingDraft(
@@ -335,8 +336,18 @@ public class CreateBookingDraftToolExecutor extends AbstractGymAgentToolExecutor
                         data,
                         LocalDateTime.now(),
                         confirmToken
-                )
+                ),
+                context.getWriteTicket()
         );
+
+        if (writeResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+            return AgentToolExecuteResult.failed(
+                    writeResult == com.sau.gym.admin.agent.store.SessionWriteResult.LOCK_LOST
+                            ? "会话状态已变更，本轮预约草稿未保存。请重新发起预约，不要重复确认。"
+                            : "会话存储暂时不可用，预约草稿未保存。请稍后再试。",
+                    "DRAFT_WRITE_" + writeResult.name()
+            );
+        }
 
         //17. 构造给用户看的草稿文本。
         String draftText =

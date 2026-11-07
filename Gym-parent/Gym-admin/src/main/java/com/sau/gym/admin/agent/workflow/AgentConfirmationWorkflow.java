@@ -66,7 +66,8 @@ public class AgentConfirmationWorkflow {
     /**
      * 处理确认/取消指令。
      */
-    public AgentRunResult handle(WorkflowDecision decision, Long userId, String sessionId, String message) {
+    public AgentRunResult handle(WorkflowDecision decision, Long userId, String sessionId, String message,
+                                 com.sau.gym.admin.agent.store.SessionWriteTicket ticket) {
         String command = String.valueOf(decision.getPayload().get("command"));
         String token = decision.getPayload().get("token") == null
                 ? null
@@ -79,28 +80,36 @@ public class AgentConfirmationWorkflow {
         switch (command) {
             case "confirm_booking" -> {
                 reply = requireLogin(userId, "请先登录后再确认预约。",
-                        () -> gymBookingTools.confirmPendingBooking(userId, sessionId, token));
+                        () -> gymBookingTools.confirmPendingBooking(userId, sessionId, token, ticket));
                 recordLog("confirmPendingBooking", "用户确认预约草稿，执行真实预约业务",
                         message, reply, System.currentTimeMillis() - start);
             }
 
             case "confirm_shopping" -> {
                 reply = requireLogin(userId, "请先登录后再确认下单。",
-                        () -> gymShoppingTools.confirmPendingShopping(userId, sessionId, token));
+                        () -> gymShoppingTools.confirmPendingShopping(userId, sessionId, token, ticket));
                 recordLog("confirmPendingShopping", "用户确认商品下单草稿，执行真实下单业务",
                         message, reply, System.currentTimeMillis() - start);
             }
 
             case "confirm_cancel_booking" -> {
                 reply = requireLogin(userId, "请先登录后再确认取消预约。",
-                        () -> agentCancelBookingService.confirmCancelBooking(userId, sessionId, token));
+                        () -> agentCancelBookingService.confirmCancelBooking(userId, sessionId, token, ticket));
                 recordLog("confirmCancelBooking", "用户确认取消预约草稿，执行真实取消预约业务",
                         message, reply, System.currentTimeMillis() - start);
             }
 
             case "clear_draft" -> {
                 if (userId != null) {
-                    draftStore.clear(userId, sessionId);
+                    //受保护清理：旧请求失锁后不得清除新持有者的草稿。
+                    com.sau.gym.admin.agent.store.SessionWriteResult clearResult =
+                            draftStore.clearIfHolder(userId, sessionId, ticket);
+                    if (clearResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+                        reply = "会话状态已变更，当前草稿未清理。";
+                        recordLog("clearPendingDraft", "清理草稿被条件写拒绝", message, reply,
+                                System.currentTimeMillis() - start);
+                        break;
+                    }
                 }
                 reply = "已取消当前待确认操作。";
                 recordLog("clearPendingDraft", "用户取消当前待确认草稿", message, reply,
@@ -129,7 +138,8 @@ public class AgentConfirmationWorkflow {
     public AgentRunResult handleCancelBookingDraft(String bookingIdText,
                                                    Long userId,
                                                    String sessionId,
-                                                   String message) {
+                                                   String message,
+                                                   com.sau.gym.admin.agent.store.SessionWriteTicket ticket) {
         if (userId == null) {
             return AgentRunResult.completed("请先登录后再取消预约。");
         }
@@ -146,6 +156,7 @@ public class AgentConfirmationWorkflow {
         context.setUserId(userId);
         context.setSessionId(sessionId);
         context.setOriginalQuestion(message);
+        context.setWriteTicket(ticket);
         context.addParam("bookingId", bookingId);
         context.addParam("reason", "用户通过Agent取消预约");
 

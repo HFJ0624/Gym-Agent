@@ -101,7 +101,8 @@ public class GymShoppingTools {
      * @param sessionId 会话id
      * @return 真正执行商品下单
      */
-    public String confirmPendingShopping(Long userId, String sessionId, String confirmToken) {
+    public String confirmPendingShopping(Long userId, String sessionId, String confirmToken,
+                                         com.sau.gym.admin.agent.store.SessionWriteTicket ticket) {
         PendingDraft draft = draftStore.get(userId, sessionId);
 
         if (draft == null || draft.type() != PendingDraftType.SHOPPING) {
@@ -152,8 +153,12 @@ public class GymShoppingTools {
             // 下单
             orderService.CreateShoppingOrder(orderDto);
 
-            // 成功后清除草稿
-            draftStore.clear(userId, sessionId);
+            // 成功后受保护清除草稿
+            com.sau.gym.admin.agent.store.SessionWriteResult clearResult =
+                    draftStore.clearIfHolder(userId, sessionId, ticket);
+            if (clearResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+                return "下单已提交，但清理本地草稿未获授权，重复确认会由业务校验拦截。";
+            }
 
             return "下单成功：\n"
                     + "商品：" + goodsName + "\n"

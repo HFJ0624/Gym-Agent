@@ -4,8 +4,10 @@ import com.sau.gym.admin.agent.runtime.AgentRunResult;
 import com.sau.gym.admin.agent.security.AgentIdentityMismatchException;
 import com.sau.gym.admin.agent.security.AgentTrustedUserResolver;
 import com.sau.gym.admin.agent.service.AgentService;
+import com.sau.gym.admin.agent.snapshot.AgentSessionSnapshotService;
 import com.sau.gym.model.dto.agent.AgentChatDto;
 import com.sau.gym.model.dto.agent.AgentChatResponse;
+import com.sau.gym.model.dto.agent.AgentSessionSnapshot;
 import com.sau.gym.model.entity.base.Result;
 import com.sau.gym.model.entity.base.ResultCodeEnum;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -32,6 +34,9 @@ public class FrontAgentController {
 
     @Autowired
     private AgentTrustedUserResolver agentTrustedUserResolver;
+
+    @Autowired
+    private AgentSessionSnapshotService agentSessionSnapshotService;
 
     /**
      * v1 兼容接口：返回字符串（草稿场景为兼容 JSON 文本）。
@@ -74,8 +79,37 @@ public class FrontAgentController {
         response.setSources(result.getSources() == null ? new ArrayList<>() : result.getSources());
         response.setCards(result.getCards() == null ? new ArrayList<>() : result.getCards());
         response.setActions(result.getActions() == null ? new ArrayList<>() : result.getActions());
+        response.setErrorCode(result.getErrorCode());
+        response.setSessionCommitted(result.isSessionCommitted());
 
         return Result.build(response, ResultCodeEnum.SUCCESS);
+    }
+
+    /**
+     * 会话恢复快照（只读）。
+     * 必须登录：以 token 解析可信身份，不采信 query 中的 userId；
+     * 不触发模型调用，不执行任何业务写操作。
+     */
+    @GetMapping("/sessions/{sessionId}")
+    public Result<AgentSessionSnapshot> sessionSnapshot(@PathVariable("sessionId") String sessionId,
+                                                        @RequestHeader(value = "token", required = false) String token) {
+
+        Long trustedUserId;
+
+        try {
+            trustedUserId = agentTrustedUserResolver.resolve(null, token);
+        } catch (AgentIdentityMismatchException e) {
+            return Result.build(null, ResultCodeEnum.ILLEGAL_REQUEST);
+        }
+
+        //恢复接口要求登录；匿名用户不提供仅凭 sessionId 枚举历史的入口。
+        if (trustedUserId == null) {
+            return Result.build(null, ResultCodeEnum.ILLEGAL_REQUEST);
+        }
+
+        AgentSessionSnapshot snapshot = agentSessionSnapshotService.buildSnapshot(trustedUserId, sessionId);
+
+        return Result.build(snapshot, ResultCodeEnum.SUCCESS);
     }
 
     /**

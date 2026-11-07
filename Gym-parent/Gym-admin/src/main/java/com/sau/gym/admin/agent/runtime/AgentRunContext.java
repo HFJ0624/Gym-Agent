@@ -68,6 +68,13 @@ public class AgentRunContext {
     private EvidenceRegistry evidenceRegistry;
 
     /**
+     * 会话受保护写入凭证。
+     * 由 Harness 从真实锁句柄生成，随工具上下文下发，
+     * 草稿、业务槽位等受保护写入在 Redis 侧原子校验令牌。
+     */
+    private transient com.sau.gym.admin.agent.store.SessionWriteTicket writeTicket;
+
+    /**
      * 当前业务上下文。
      */
     private AgentBusinessContext businessContext;

@@ -75,7 +75,8 @@ class AgentSessionIsolationTest {
             return true;
         });
 
-        messageStore = new RedisAgentSessionMessageStore(stringRedisTemplate, objectMapper);
+        messageStore = new RedisAgentSessionMessageStore(stringRedisTemplate, objectMapper,
+                mock(com.sau.gym.admin.agent.store.SessionProtectedRedis.class));
 
         draftMap = new HashMap<>();
 
@@ -93,7 +94,8 @@ class AgentSessionIsolationTest {
             return true;
         });
 
-        draftStore = new AgentDraftStore(draftRedisTemplate);
+        draftStore = new AgentDraftStore(draftRedisTemplate,
+                mock(com.sau.gym.admin.agent.store.SessionProtectedRedis.class));
     }
 
     @Test

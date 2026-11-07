@@ -98,6 +98,10 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
 
     private final AgentSopCatalog sopCatalog;
 
+    private final com.sau.gym.admin.agent.run.AgentRunStore agentRunStore;
+
+    private final com.sau.gym.admin.agent.snapshot.AgentResponseAssembler responseAssembler;
+
     private final ObjectMapper objectMapper;
 
     public DefaultGymAgentHarness(AgentHarnessProperties properties,
@@ -116,6 +120,8 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                                   AgentTraceService traceService,
                                   AgentDraftStore draftStore,
                                   AgentSopCatalog sopCatalog,
+                                  com.sau.gym.admin.agent.run.AgentRunStore agentRunStore,
+                                  com.sau.gym.admin.agent.snapshot.AgentResponseAssembler responseAssembler,
                                   ObjectMapper objectMapper) {
         this.properties = properties;
         this.messageStore = messageStore;
@@ -133,6 +139,8 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
         this.traceService = traceService;
         this.draftStore = draftStore;
         this.sopCatalog = sopCatalog;
+        this.agentRunStore = agentRunStore;
+        this.responseAssembler = responseAssembler;
         this.objectMapper = objectMapper;
     }
 
@@ -145,6 +153,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
         AgentRunContext reactContext;
         AgentSessionLockService.LockHandle lockHandle;
         SessionHistory pendingHistory;
+        com.sau.gym.admin.agent.store.SessionWriteTicket writeTicket;
     }
 
     /**
@@ -157,20 +166,30 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                                  String sessionId,
                                  RunSession session,
                                  AgentRunResult result) {
+        //读取失败的快照不可信：此时提交会用未知状态覆盖原记录，必须跳过。
+        if (session.snapshot != null && session.snapshot.isLoadFailed()) {
+            trace("SESSION_COMMIT", "历史读取失败，跳过会话提交", sessionId, null, "FAILED",
+                    "history load failed, refuse to overwrite with unknown state", 0L);
+            return false;
+        }
+
         if (session.lockHandle != null && !session.lockHandle.isLeaseValid()) {
             trace("SESSION_COMMIT", "会话锁已失效，跳过会话提交", sessionId, null, "FAILED",
                     "lock lease invalid, skip commit to avoid overwriting newer session state", 0L);
             return false;
         }
 
-        boolean committed = messageStore.saveHistory(userId, sessionId, session.pendingHistory);
+        //Redis 原子校验持有令牌后写入，关闭检查与写入之间的覆盖窗口。
+        com.sau.gym.admin.agent.store.SessionWriteResult writeResult =
+                messageStore.saveHistoryIfHolder(userId, sessionId, session.pendingHistory, session.writeTicket);
 
-        if (!committed) {
-            trace("SESSION_COMMIT", "会话消息提交失败", sessionId, null, "FAILED",
-                    "session history store save failed", 0L);
+        if (writeResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+            trace("SESSION_COMMIT", "会话提交未成功", sessionId, null, "FAILED",
+                    "protected write result=" + writeResult, 0L);
+            return false;
         }
 
-        return committed;
+        return true;
     }
 
     @Override
@@ -195,6 +214,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
 
         RunSession session = new RunSession();
         session.lockHandle = lock;
+        session.writeTicket = lock.toTicket();
 
         try {
             trace("HARNESS_START", "开始处理本轮请求",
@@ -202,6 +222,13 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
 
             //1. 加载会话历史快照（消息 + 摘要）。
             session.snapshot = messageStore.loadHistory(userId, sessionId);
+
+            //1.1 建立持久运行记录；失败只降级，不阻断对话。
+            boolean runTracked = agentRunStore.startRunning(userId, sessionId, runId,
+                    com.sau.gym.admin.agent.run.AgentRunStage.CONSULTING.name(), session.writeTicket);
+            trace("RUN_START", "建立运行记录",
+                    "sessionId=" + sessionId + ", runId=" + runId,
+                    "tracked=" + runTracked, "SUCCESS", null, 0L);
 
             //2. 输入安全检查。
             AgentSafetyCheckResult safetyResult = safetyService.checkUserMessage(userId, message);
@@ -215,7 +242,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
 
             //3. 业务上下文准备。
             AgentBusinessContext businessContext = contextEnhanceService.prepareBeforeAgent(
-                    userId, sessionId, message, request.getChatDto()
+                    userId, sessionId, message, request.getChatDto(), session.writeTicket
             );
 
             //4. 意图识别与问题重写，属于辅助信息，失败不应阻断主流程。
@@ -234,7 +261,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                     intentResult, rewriteResult, session);
 
             //6. 草稿生成后把准确槽位回写业务上下文。
-            refreshContext(userId, sessionId);
+            refreshContext(userId, sessionId, session.writeTicket);
 
             return finish(result, request, sessionId, session);
 
@@ -275,14 +302,19 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
             return AgentRunResult.failed("会话状态已失效，请重新发送请求。", "LOCK_LOST");
         }
 
+        //进入确认办理阶段：恢复查询据此区分“可安全重问”与“结果需核实”。
+        agentRunStore.updateStage(request.getUserId(), sessionId, request.getRunId(),
+                com.sau.gym.admin.agent.run.AgentRunStage.CONFIRMING.name(), session.writeTicket);
+
         return switch (decision.getType()) {
-            case CONFIRMATION -> confirmationWorkflow.handle(decision, userId, sessionId, message);
+            case CONFIRMATION -> confirmationWorkflow.handle(decision, userId, sessionId, message, session.writeTicket);
 
             case CANCEL_BOOKING_DRAFT -> confirmationWorkflow.handleCancelBookingDraft(
                     String.valueOf(decision.getPayload().get("bookingId")),
                     userId,
                     sessionId,
-                    message
+                    message,
+                    session.writeTicket
             );
 
             case CLARIFY -> {
@@ -443,6 +475,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
         if (session.lockHandle != null) {
             runContext.setLockValidSupplier(session.lockHandle::isLeaseValid);
         }
+        runContext.setWriteTicket(session.writeTicket);
 
         session.reactContext = runContext;
 
@@ -551,7 +584,10 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
         session.pendingHistory.setSummary(summary);
         session.pendingHistory.setSummaryVersion(summaryVersion);
 
-        //3. 摘要与裁剪后的消息一次提交；提交前用真实锁租约状态做保护，
+        //3. 构建本轮展示轮次并写入快照（按 runId 去重，供恢复展示）。
+        upsertDisplayTurn(session.pendingHistory, request.getRunId(), request.getMessage(), result);
+
+        //4. 摘要与裁剪后的消息一次提交；Redis 原子校验锁令牌，
         //锁失效（过期/被新请求接管）的旧请求不得覆盖新状态。
         boolean committed = commitSessionHistory(request.getUserId(), sessionId, session, result);
         result.setSessionCommitted(committed);
@@ -582,7 +618,61 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                 result.getErrorCode(),
                 result.getCostMs());
 
+        //5. 持久运行终态；写入失败只降级，恢复查询会如实显示状态缺失。
+        agentRunStore.finish(request.getUserId(), sessionId, request.getRunId(),
+                result.getStatus(),
+                com.sau.gym.admin.agent.run.AgentRunStage.FINISHING.name(),
+                result.getErrorCode(),
+                committed,
+                session.pendingHistory == null ? -1L : session.pendingHistory.getRevision(),
+                session.writeTicket);
+
+        trace("RUN_FINISH", "运行终态已记录",
+                "sessionId=" + sessionId + ", runId=" + request.getRunId(),
+                "status=" + result.getStatus() + ", committed=" + committed,
+                "SUCCESS", null, 0L);
+
         return result;
+    }
+
+    /**
+     * 构建并合并本轮展示轮次。
+     * turnId 使用该轮 runId，恢复合并与去重均使用稳定标识，不依赖下标或正文比较。
+     */
+    private void upsertDisplayTurn(SessionHistory history, String runId, String userMessage,
+                                   AgentRunResult result) {
+        if (history == null) {
+            return;
+        }
+
+        if (history.getDisplayTurns() == null) {
+            history.setDisplayTurns(new ArrayList<>());
+        }
+
+        String replyText = StringUtils.hasText(result.getReplyText())
+                ? result.getReplyText()
+                : result.getDisplayPayload();
+
+        com.sau.gym.admin.agent.memory.model.DisplayTurn turn =
+                com.sau.gym.admin.agent.memory.model.DisplayTurn.builder()
+                        .turnId(runId)
+                        .runId(runId)
+                        .userText(userMessage)
+                        .replyText(replyText)
+                        .status(result.getStatus() == null ? null : result.getStatus().name())
+                        .sources(result.getSources() == null
+                                ? new ArrayList<>() : result.getSources())
+                        .createTime(System.currentTimeMillis())
+                        .build();
+
+        //同 runId 重跑（理论不应发生）时替换，保证每轮只有一条展示记录。
+        history.getDisplayTurns().removeIf(existing -> runId.equals(existing.getTurnId()));
+        history.getDisplayTurns().add(turn);
+
+        //有界：只保留最近 20 轮展示内容。
+        while (history.getDisplayTurns().size() > 20) {
+            history.getDisplayTurns().remove(0);
+        }
     }
 
     /**
@@ -603,29 +693,9 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
             return;
         }
 
-        Map<String, Object> card = new LinkedHashMap<>();
-        card.put("type", draft.type().name());
-        card.put("data", draft.data());
-        card.put("confirmToken", draft.confirmToken());
-        result.getCards().add(card);
-
-        String confirmLabel = switch (draft.type()) {
-            case BOOKING -> "确认预约";
-            case SHOPPING -> "确认下单";
-            case CANCEL_BOOKING -> "确认取消预约";
-        };
-
-        Map<String, Object> confirmAction = new LinkedHashMap<>();
-        confirmAction.put("type", "confirm");
-        confirmAction.put("label", confirmLabel);
-        confirmAction.put("command", confirmLabel + " " + draft.confirmToken());
-        result.getActions().add(confirmAction);
-
-        Map<String, Object> cancelAction = new LinkedHashMap<>();
-        cancelAction.put("type", "cancel");
-        cancelAction.put("label", "取消");
-        cancelAction.put("command", "取消");
-        result.getActions().add(cancelAction);
+        //卡片与动作由共享组装器生成，与会话恢复快照保持一致。
+        result.getCards().add(responseAssembler.buildCard(draft));
+        result.getActions().addAll(responseAssembler.buildActions(draft));
     }
 
     /**
@@ -649,14 +719,24 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                 return;
             }
 
-            SessionHistory commit = new SessionHistory();
-            commit.setMessages(session.snapshot == null
+            if (session.lockHandle != null && !session.lockHandle.isLeaseValid()) {
+                log.warn("[AgentHarness] 异常分支跳过会话提交：会话锁已失效, sessionId={}", sessionId);
+                return;
+            }
+
+            session.pendingHistory = new SessionHistory();
+            session.pendingHistory.setMessages(session.snapshot == null
                     ? result.getNewMessages()
                     : mergeHistory(session.snapshot.getMessages(), result.getNewMessages()));
-            commit.setSummary(session.snapshot == null ? null : session.snapshot.getSummary());
-            commit.setSummaryVersion(session.snapshot == null ? 0 : session.snapshot.getSummaryVersion());
+            session.pendingHistory.setSummary(session.snapshot == null ? null : session.snapshot.getSummary());
+            session.pendingHistory.setSummaryVersion(session.snapshot == null ? 0 : session.snapshot.getSummaryVersion());
 
-            messageStore.saveHistory(userId, sessionId, commit);
+            com.sau.gym.admin.agent.store.SessionWriteResult writeResult =
+                    messageStore.saveHistoryIfHolder(userId, sessionId, session.pendingHistory, session.writeTicket);
+
+            if (writeResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+                log.warn("[AgentHarness] 异常分支受保护提交未成功: {}, sessionId={}", writeResult, sessionId);
+            }
         } catch (Exception e) {
             log.warn("[AgentHarness] 异常分支会话提交失败: {}", e.getMessage());
         }
@@ -741,9 +821,9 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
     /**
      * 刷新业务上下文，失败不影响主流程。
      */
-    private void refreshContext(Long userId, String sessionId) {
+    private void refreshContext(Long userId, String sessionId, com.sau.gym.admin.agent.store.SessionWriteTicket ticket) {
         try {
-            contextEnhanceService.refreshAfterAgent(userId, sessionId);
+            contextEnhanceService.refreshAfterAgent(userId, sessionId, ticket);
         } catch (Exception e) {
             trace("CONTEXT_REFRESH", "刷新业务上下文失败", null, null, "FAILED", e.getMessage(), 0L);
         }

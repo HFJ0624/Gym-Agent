@@ -5,6 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sau.gym.admin.agent.memory.model.SessionHistory;
 import com.sau.gym.admin.agent.memory.model.SessionMessage;
 import com.sau.gym.admin.agent.memory.service.AgentSessionMessageStore;
+import com.sau.gym.admin.agent.store.SessionProtectedRedis;
+import com.sau.gym.admin.agent.store.SessionWriteResult;
+import com.sau.gym.admin.agent.store.SessionWriteTicket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -51,10 +54,17 @@ public class RedisAgentSessionMessageStore implements AgentSessionMessageStore {
 
     private final ObjectMapper objectMapper;
 
+    /**
+     * 持有者保护写入（Redis 原子校验锁令牌）。
+     */
+    private final SessionProtectedRedis protectedRedis;
+
     public RedisAgentSessionMessageStore(StringRedisTemplate stringRedisTemplate,
-                                         ObjectMapper objectMapper) {
+                                         ObjectMapper objectMapper,
+                                         SessionProtectedRedis protectedRedis) {
         this.stringRedisTemplate = stringRedisTemplate;
         this.objectMapper = objectMapper;
+        this.protectedRedis = protectedRedis;
     }
 
     @Override
@@ -90,12 +100,20 @@ public class RedisAgentSessionMessageStore implements AgentSessionMessageStore {
 
             history.setSummary(stored.getSummary());
             history.setSummaryVersion(stored.getSummaryVersion());
+            history.setRevision(stored.getRevision());
             history.setMessages(stored.getMessages() == null ? new ArrayList<>() : stored.getMessages());
+            history.setDisplayTurns(stored.getDisplayTurns() == null
+                    ? new ArrayList<>()
+                    : stored.getDisplayTurns());
 
             return history;
+
         } catch (Exception e) {
-            //历史读取失败按空历史处理，不影响本轮对话，但要留下可观察日志。
+            //读取失败必须与“正常没有历史”区分：失败时历史不可信，
+            //调用方不得用空历史覆盖原记录。
             log.warn("[AgentSession] 读取会话历史失败, sessionId={}, reason={}", sessionId, e.getMessage());
+            history.setLoadFailed(true);
+            history.setLoadError(e.getMessage());
             return history;
         }
     }
@@ -123,7 +141,11 @@ public class RedisAgentSessionMessageStore implements AgentSessionMessageStore {
             SessionHistory snapshot = new SessionHistory();
             snapshot.setSummary(history.getSummary());
             snapshot.setSummaryVersion(history.getSummaryVersion());
+            snapshot.setRevision(history.getRevision());
             snapshot.setMessages(messages);
+            snapshot.setDisplayTurns(history.getDisplayTurns() == null
+                    ? new ArrayList<>()
+                    : history.getDisplayTurns());
 
             String json = objectMapper.writeValueAsString(snapshot);
             stringRedisTemplate.opsForValue().set(key, json, TTL);
@@ -133,6 +155,58 @@ public class RedisAgentSessionMessageStore implements AgentSessionMessageStore {
             //写入失败必须让上层知道，避免宣称会话状态已保存。
             log.warn("[AgentSession] 写入会话历史失败, sessionId={}, reason={}", sessionId, e.getMessage());
             return false;
+        }
+    }
+
+    @Override
+    public SessionWriteResult saveHistoryIfHolder(Long userId, String sessionId, SessionHistory history,
+                                                  SessionWriteTicket ticket) {
+        if (history == null) {
+            return SessionWriteResult.SAVED;
+        }
+
+        if (ticket == null) {
+            //Agent 主链不允许无令牌的受保护写入。
+            return SessionWriteResult.LOCK_LOST;
+        }
+
+        try {
+            String key = buildKey(userId, sessionId);
+
+            List<SessionMessage> messages = history.getMessages() == null
+                    ? new ArrayList<>()
+                    : new ArrayList<>(history.getMessages());
+
+            while (messages.size() > MAX_MESSAGE_COUNT) {
+                messages.remove(0);
+            }
+
+            //裁剪后仍需保证 tool 消息能找到对应的 assistant tool_calls。
+            messages = dropOrphanToolMessages(messages);
+
+            SessionHistory snapshot = new SessionHistory();
+            snapshot.setSummary(history.getSummary());
+            snapshot.setSummaryVersion(history.getSummaryVersion());
+            //状态提交版本：在旧快照版本上递增，仅表示提交次数，不复用 summaryVersion。
+            snapshot.setRevision(history.getRevision() + 1);
+            snapshot.setMessages(messages);
+            snapshot.setDisplayTurns(history.getDisplayTurns() == null
+                    ? new ArrayList<>()
+                    : history.getDisplayTurns());
+
+            String json = objectMapper.writeValueAsString(snapshot);
+
+            return protectedRedis.writeIfHolder(
+                    ticket.lockKey(),
+                    ticket.token(),
+                    key,
+                    json,
+                    TTL
+            );
+        } catch (Exception e) {
+            log.warn("[AgentSession] 受保护写入会话历史失败, sessionId={}, reason={}",
+                    sessionId, e.getMessage());
+            return SessionWriteResult.STORE_UNAVAILABLE;
         }
     }
 
