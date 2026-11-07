@@ -31,4 +31,28 @@
             update_time = #{date}
         where user_id = #{userId}
     </update>
+
+    <!-- 条件扣减余额：余额充足才扣减，零行表示余额不足或并发变化 -->
+    <update id="decreaseBalance">
+        update user_balance
+        set balance = balance - #{amount},
+            update_time = #{date}
+        where user_id = #{userId}
+          and balance &gt;= #{amount}
+    </update>
+
+    <!-- 条件增加余额（退款等场景） -->
+    <update id="increaseBalance">
+        update user_balance
+        set balance = balance + #{amount},
+            update_time = #{date}
+        where user_id = #{userId}
+    </update>
+
+    <!-- 查询余额数值，用于流水 before/after 的权威数值 -->
+    <select id="getBalanceValue" resultType="java.math.BigDecimal">
+        select balance
+        from user_balance
+        where user_id = #{userId}
+    </select>
 </mapper>

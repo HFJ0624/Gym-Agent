@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.sau.gym.admin.mapper.ShoppingConfirmationMapper">
+
+    <!-- 插入确认回执，与订单同一事务提交 -->
+    <insert id="insertOne">
+        INSERT INTO shopping_confirmation (
+            confirmation_id, user_id, session_id, snapshot_hash,
+            order_id, order_no, status, create_time
+        ) VALUES (
+            #{confirmationId}, #{userId}, #{sessionId}, #{snapshotHash},
+            #{orderId}, #{orderNo}, #{status}, #{createTime}
+        )
+    </insert>
+
+    <!-- 按确认标识查询回执 -->
+    <select id="selectByConfirmationId" resultType="com.sau.gym.model.entity.order.ShoppingConfirmation">
+        SELECT
+            id,
+            confirmation_id AS confirmationId,
+            user_id AS userId,
+            session_id AS sessionId,
+            snapshot_hash AS snapshotHash,
+            order_id AS orderId,
+            order_no AS orderNo,
+            status AS status,
+            create_time AS createTime
+        FROM shopping_confirmation
+        WHERE confirmation_id = #{confirmationId}
+    </select>
+
+    <!-- 同事务内回填订单结果 -->
+    <update id="updateResult">
+        update shopping_confirmation
+        set order_id = #{orderId},
+            order_no = #{orderNo},
+            status = #{status}
+        where confirmation_id = #{confirmationId}
+    </update>
+
+</mapper>

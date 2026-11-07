@@ -113,6 +113,31 @@ public class FrontAgentController {
     }
 
     /**
+     * 商品确认结果查询（只读）。
+     * 按可信身份归属校验；他人 confirmationId 返回空结果，不泄露任何订单信息。
+     */
+    @GetMapping("/confirmations/{confirmationId}")
+    public Result<com.sau.gym.model.vo.order.OrderConfirmationResult> confirmationResult(
+            @PathVariable("confirmationId") String confirmationId,
+            @RequestHeader(value = "token", required = false) String token) {
+
+        Long trustedUserId;
+
+        try {
+            trustedUserId = agentTrustedUserResolver.resolve(null, token);
+        } catch (AgentIdentityMismatchException e) {
+            return Result.build(null, ResultCodeEnum.ILLEGAL_REQUEST);
+        }
+
+        if (trustedUserId == null) {
+            return Result.build(null, ResultCodeEnum.ILLEGAL_REQUEST);
+        }
+
+        return Result.build(agentService.queryConfirmation(trustedUserId, confirmationId),
+                ResultCodeEnum.SUCCESS);
+    }
+
+    /**
      * 解析可信身份并执行一轮 Harness。
      * 身份不一致时返回 null，由调用方返回非法请求。
      */

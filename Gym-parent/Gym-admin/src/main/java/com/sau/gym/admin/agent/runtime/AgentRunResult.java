@@ -69,6 +69,18 @@ public class AgentRunResult {
     private String sessionId;
 
     /**
+     * 业务标识（如商品确认 confirmationId），由 Workflow 按真实业务结果回填，
+     * 用于运行记录与恢复查询关联订单。
+     */
+    private String businessId;
+
+    /**
+     * 显式业务失败标记：办理类业务返回明确失败时置为 true，
+     * 使 Trace 与恢复展示不把该轮记成业务成功。
+     */
+    private boolean businessFailure = false;
+
+    /**
      * 本轮运行标识，由入口服务回填。
      */
     private String runId;
@@ -151,8 +163,16 @@ public class AgentRunResult {
      * 是否属于业务上成功的终态。
      */
     public boolean isBusinessSuccess() {
+        if (businessFailure) {
+            return false;
+        }
+
         return status == AgentRunStatus.COMPLETED
                 || status == AgentRunStatus.NEED_CLARIFICATION
                 || status == AgentRunStatus.WAITING_CONFIRMATION;
+    }
+
+    public void setBusinessFailure(boolean businessFailure) {
+        this.businessFailure = businessFailure;
     }
 }

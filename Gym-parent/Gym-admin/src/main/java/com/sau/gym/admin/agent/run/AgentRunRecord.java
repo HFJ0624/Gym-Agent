@@ -60,6 +60,11 @@ public class AgentRunRecord implements Serializable {
     private Long revision;
 
     /**
+     * 业务标识（如商品确认 confirmationId）。
+     */
+    private String businessId;
+
+    /**
      * 创建时间（epoch 毫秒）。
      */
     private Long createTime;

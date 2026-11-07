@@ -144,13 +144,15 @@ public class AgentRunStore {
      */
     public boolean finish(Long userId, String sessionId, String runId,
                           AgentRunStatus status, String stage, String errorCode,
-                          boolean sessionCommitted, long revision, SessionWriteTicket ticket) {
+                          boolean sessionCommitted, long revision, String businessId,
+                          SessionWriteTicket ticket) {
         return updateFields(userId, sessionId, runId, ticket,
                 "status", status == null ? "" : status.name(),
                 "stage", stage == null ? "" : stage,
                 "errorCode", errorCode == null ? "" : errorCode,
                 "sessionCommitted", String.valueOf(sessionCommitted),
                 "revision", String.valueOf(revision),
+                "businessId", businessId == null ? "" : businessId,
                 "updateTime", String.valueOf(System.currentTimeMillis()));
     }
 
@@ -185,6 +187,7 @@ public class AgentRunStore {
             record.setErrorCode(asString(entries.get("errorCode"), null));
             record.setSessionCommitted(asBoolean(entries.get("sessionCommitted")));
             record.setRevision(asLong(entries.get("revision")));
+            record.setBusinessId(asString(entries.get("businessId"), null));
             record.setCreateTime(asLong(entries.get("createTime")));
             record.setUpdateTime(asLong(entries.get("updateTime")));
 

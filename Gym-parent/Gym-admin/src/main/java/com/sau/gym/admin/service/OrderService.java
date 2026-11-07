@@ -14,6 +14,19 @@ public interface OrderService {
     //创建订单
     void CreateShoppingOrder(OrderDto orderDto);
 
+    /**
+     * 商品确认办理（客服链路，结构化结果）。
+     * 事务核心在 ShoppingOrderTxService；本方法为非事务门面，负责异常到结果的映射。
+     */
+    com.sau.gym.model.vo.order.OrderConfirmationResult confirmShopping(
+            com.sau.gym.model.dto.order.ShoppingConfirmationCommand command);
+
+    /**
+     * 按确认标识查询回执与订单真实状态（只读，归属校验）。
+     */
+    com.sau.gym.model.vo.order.OrderConfirmationResult queryConfirmation(
+            Long userId, String confirmationId);
+
     //获取购物订单列表
     PageInfo<OrderDetailVO> getOrderList(Integer page, Integer limit, Integer status);
 

@@ -148,6 +148,10 @@ public class CreateShoppingDraftToolExecutor extends AbstractGymAgentToolExecuto
         data.put("price", beverage.getPrice());
         data.put("image", beverage.getImage());
 
+        //第四轮：生成与本次业务意图绑定的稳定确认标识（刷新与重试沿用，修改商品/数量/价格后更换）。
+        String confirmationId = java.util.UUID.randomUUID().toString().replace("-", "");
+        data.put("confirmationId", confirmationId);
+
         String confirmToken = AgentConfirmTokenUtil.generateToken();
 
         // 保存商品下单草稿到 Redis，按 userId + sessionId 隔离。

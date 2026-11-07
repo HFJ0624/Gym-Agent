@@ -49,6 +49,11 @@ public class GymShoppingTools {
 
     private final AgentToolContextFactory agentToolContextFactory;
 
+    /**
+     * 最近一次商品确认的结构化结果（请求线程内有效，供 Workflow 读取）。
+     */
+    private com.sau.gym.model.vo.order.OrderConfirmationResult lastConfirmationResult;
+
     public GymShoppingTools(BeverageMapper beverageMapper,
                             CartMapper cartMapper,
                             UserMapper userMapper,
@@ -118,55 +123,90 @@ public class GymShoppingTools {
             return "确认码错误，请核对后重新输入。正确格式为：确认下单 " + draft.confirmToken();
         }
 
-        try {
-            Map<String, Object> data = draft.data();
+        Map<String, Object> data = draft.data();
 
-            Long goodsId = ((Number) data.get("goodsId")).longValue();
-            String goodsName = String.valueOf(data.get("goodsName"));
-            Integer quantity = ((Number) data.get("quantity")).intValue();
+        //1. 确定业务确认标识：新草稿自带；旧有效草稿在持有会话执行权时受控补齐一次。
+        String confirmationId = data.get("confirmationId") == null
+                ? null
+                : String.valueOf(data.get("confirmationId"));
 
-            Beverage beverage = beverageMapper.selectById(goodsId);
-            if (beverage == null) {
-                return "下单失败：商品不存在。";
+        if (confirmationId == null || confirmationId.isBlank()) {
+            confirmationId = java.util.UUID.randomUUID().toString().replace("-", "");
+
+            Map<String, Object> patched = new java.util.LinkedHashMap<>(data);
+            patched.put("confirmationId", confirmationId);
+
+            com.sau.gym.admin.agent.store.SessionWriteResult patchResult = draftStore.saveIfHolder(
+                    userId, sessionId,
+                    new PendingDraft(draft.type(), patched, draft.createdAt(), draft.confirmToken()),
+                    ticket
+            );
+
+            if (patchResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
+                return "会话状态已变更或存储暂不可用，本次确认未执行。请重新查看草稿后再确认。";
             }
-            if (beverage.getStock() < quantity) {
-                return "下单失败：库存不足。";
-            }
+        }
 
-            Cart autoCart = new Cart();
-            autoCart.setUserId(userId);
-            autoCart.setGoodsId(beverage.getId());
-            autoCart.setGoodsName(beverage.getGoodsName());
-            autoCart.setPrice(beverage.getPrice());
-            autoCart.setQuantity(quantity);
-            autoCart.setImage(beverage.getImage());
-            cartMapper.insert(autoCart);
+        //2. 直接进入共享交易核心：不再插入临时购物车，参数全部来自服务端草稿快照与可信身份。
+        com.sau.gym.model.dto.order.ShoppingConfirmationCommand command =
+                new com.sau.gym.model.dto.order.ShoppingConfirmationCommand();
+        command.setUserId(userId);
+        command.setSessionId(sessionId);
+        command.setConfirmationId(confirmationId);
+        command.setGoodsId(((Number) data.get("goodsId")).longValue());
+        command.setGoodsName(String.valueOf(data.get("goodsName")));
+        command.setQuantity(((Number) data.get("quantity")).intValue());
+        command.setPriceSnapshot(data.get("price") == null
+                ? java.math.BigDecimal.ZERO
+                : new java.math.BigDecimal(String.valueOf(data.get("price"))));
 
-            OrderDto orderDto = new OrderDto();
-            orderDto.setCartIds(Collections.singletonList(autoCart.getId()));
-            orderDto.setRemark("LangChain4j智能下单");
+        com.sau.gym.model.vo.order.OrderConfirmationResult result = orderService.confirmShopping(command);
+        this.lastConfirmationResult = result;
 
-            // 设置当前用户上下文
-            User user = userMapper.selectById(userId);
-            AuthContextUtil.set(user);
+        //3. 按真实业务状态给出可读回复与草稿处理；不伪造成功。
+        String status = result.getStatus();
 
-            // 下单
-            orderService.CreateShoppingOrder(orderDto);
-
-            // 成功后受保护清除草稿
+        if (com.sau.gym.model.enums.order.OrderConfirmationStatus.PAID.name().equals(status)
+                || com.sau.gym.model.enums.order.OrderConfirmationStatus.PENDING_PAYMENT.name().equals(status)) {
+            //数据库已提交：受保护清理本次草稿；清理失败不影响回执，重复确认由回执收敛。
             com.sau.gym.admin.agent.store.SessionWriteResult clearResult =
                     draftStore.clearIfHolder(userId, sessionId, ticket);
+
             if (clearResult != com.sau.gym.admin.agent.store.SessionWriteResult.SAVED) {
-                return "下单已提交，但清理本地草稿未获授权，重复确认会由业务校验拦截。";
+                return result.getMessage()
+                        + "\n（提示：本地草稿清理未获授权，重复确认会自动定位本订单，不会重复扣款。）";
             }
 
-            return "下单成功：\n"
-                    + "商品：" + goodsName + "\n"
-                    + "数量：" + quantity + "\n"
-                    + "总价：" + beverage.getPrice().multiply(BigDecimal.valueOf(quantity)) + "\n"
-                    + "已调用系统原有商城下单逻辑完成结算。";
-        } catch (Exception e) {
-            return "下单失败：" + e.getMessage();
+            return result.getMessage();
         }
+
+        if (com.sau.gym.model.enums.order.OrderConfirmationStatus.PRICE_CHANGED.name().equals(status)
+                && result.getLatestSnapshot() != null) {
+            //价格变化：生成新价格草稿等待再次明确确认；本次扣款为零。
+            Map<String, Object> newDraftData = new java.util.LinkedHashMap<>(result.getLatestSnapshot());
+            String newConfirmationId = java.util.UUID.randomUUID().toString().replace("-", "");
+            newDraftData.put("confirmationId", newConfirmationId);
+
+            String newToken = AgentConfirmTokenUtil.generateToken();
+
+            draftStore.saveIfHolder(userId, sessionId,
+                    new PendingDraft(PendingDraftType.SHOPPING, newDraftData,
+                            java.time.LocalDateTime.now(), newToken),
+                    ticket);
+
+            return result.getMessage()
+                    + "\n新草稿确认码：" + newToken
+                    + "\n如确认按新价格下单，请回复：确认下单 " + newToken;
+        }
+
+        //RESULT_UNKNOWN / OUT_OF_STOCK / BUSINESS_FAILED：如实返回；草稿保留（RESULT_UNKNOWN 由回执收敛，失败可调整重试）。
+        return result.getMessage();
+    }
+
+    /**
+     * 最近一次商品确认的结构化结果（Workflow 组装结构化回复用）。
+     */
+    public com.sau.gym.model.vo.order.OrderConfirmationResult getLastConfirmationResult() {
+        return lastConfirmationResult;
     }
 }

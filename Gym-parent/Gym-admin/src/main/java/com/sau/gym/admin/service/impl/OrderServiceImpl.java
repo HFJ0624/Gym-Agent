@@ -13,6 +13,7 @@ import com.sau.gym.model.entity.event.NotificationEvent;
 import com.sau.gym.model.entity.finance.BalanceRecord;
 import com.sau.gym.model.entity.finance.PaymentRecord;
 import com.sau.gym.model.entity.order.Order;
+import com.sau.gym.model.entity.order.ShoppingConfirmation;
 import com.sau.gym.model.entity.order.OrderItem;
 import com.sau.gym.model.entity.shopping.Beverage;
 import com.sau.gym.model.entity.shopping.Cart;
@@ -69,6 +70,62 @@ public class OrderServiceImpl implements OrderService {
     @Autowired
     private ApplicationEventPublisher eventPublisher;
 
+    @Autowired
+    private ShoppingOrderTxService shoppingOrderTxService;
+
+    @Autowired
+    private ShoppingConfirmationMapper shoppingConfirmationMapper;
+
+    /**
+     * 商品确认办理门面（客服链路）。
+     * 异常映射：
+     * - SauException：事务已明确回滚，结果为明确业务失败；
+     * - 其他异常：提交结果无法确定，返回 RESULT_UNKNOWN 并提示只读查询核实。
+     */
+    @Override
+    public com.sau.gym.model.vo.order.OrderConfirmationResult confirmShopping(
+            com.sau.gym.model.dto.order.ShoppingConfirmationCommand command) {
+        try {
+            return shoppingOrderTxService.confirm(command);
+        } catch (SauException e) {
+            com.sau.gym.model.vo.order.OrderConfirmationResult result =
+                    new com.sau.gym.model.vo.order.OrderConfirmationResult();
+            result.setStatus(com.sau.gym.model.enums.order.OrderConfirmationStatus.BUSINESS_FAILED.name());
+            result.setErrorCode("TX_BUSINESS_FAILED");
+            result.setConfirmationId(command == null ? null : command.getConfirmationId());
+            result.setMessage("下单未成功：" + e.getMessage() + "。本次未扣款，可重新发起确认。");
+            return result;
+        } catch (Exception e) {
+            com.sau.gym.model.vo.order.OrderConfirmationResult result =
+                    new com.sau.gym.model.vo.order.OrderConfirmationResult();
+            result.setStatus(com.sau.gym.model.enums.order.OrderConfirmationStatus.RESULT_UNKNOWN.name());
+            result.setErrorCode("TX_RESULT_UNKNOWN");
+            result.setConfirmationId(command == null ? null : command.getConfirmationId());
+            result.setMessage("本次下单结果待核实，请稍后通过确认记录查询，不要盲目重复确认。");
+            return result;
+        }
+    }
+
+    /**
+     * 按确认标识查询回执与订单真实状态（只读，归属校验）。
+     */
+    @Override
+    public com.sau.gym.model.vo.order.OrderConfirmationResult queryConfirmation(
+            Long userId, String confirmationId) {
+        ShoppingConfirmation confirmation = shoppingConfirmationMapper.selectByConfirmationId(confirmationId);
+
+        if (confirmation == null) {
+            return null;
+        }
+
+        if (!userId.equals(confirmation.getUserId())) {
+            //他人确认标识不泄露任何订单信息。
+            return null;
+        }
+
+        return shoppingOrderTxService.buildReplayResult(userId, confirmation);
+    }
+
     //创建订单
     @Transactional
     @Override
@@ -82,12 +139,25 @@ public class OrderServiceImpl implements OrderService {
         Cart cart = null;
         Beverage beverage;
 
-        //2.判断库存是否充足,库存不够不创建订单
+        //2.校验购物车归属与库存。
+        //归属校验：防止越权使用他人购物车条目。
+        //库存不足必须显式抛出业务异常：原实现静默 return 会被上层当成成功。
         for (Long cartId : cartIds){
             cart = cartMapper.getByCartId(cartId);
+
+            if (cart == null || !user.getId().equals(cart.getUserId())) {
+                throw new SauException(500, "购物车不存在或无权操作");
+            }
+
             beverage = beverageMapper.selectById(cart.getGoodsId());
+
+            if (beverage == null || beverage.getStatus() == null || beverage.getStatus() != 1) {
+                throw new SauException(500, "商品不存在或已下架：" + cart.getGoodsName());
+            }
+
             if (beverage.getStock() < cart.getQuantity()){
-                return;
+                throw new SauException(500, "库存不足：" + cart.getGoodsName()
+                        + " 剩余 " + beverage.getStock() + " 件");
             }
         }
 
@@ -122,8 +192,6 @@ public class OrderServiceImpl implements OrderService {
             balanceRecord.setOrderNo(order_no);
             balanceRecord.setAmount(totalPrice);
             balanceRecord.setType(2);
-            balanceRecord.setBeforeBalance(userBalance.getBalance());
-            balanceRecord.setAfterBalance(userBalance.getBalance().subtract(totalPrice));
             balanceRecord.setCreateTime(new Date());
             balanceRecord.setRemark("用户下商城订单,订单金额:" + totalPrice + "元");
             balanceRecordMapper.insertOne(balanceRecord);
@@ -141,18 +209,34 @@ public class OrderServiceImpl implements OrderService {
             paymentRecord.setPayTime(date);
             paymentRecordMapper.insertOne(paymentRecord);
 
-            //更新余额
-            BigDecimal surplus = userBalance.getBalance().subtract(totalPrice);
-            userBalanceMapper.updateBalance(user.getId(),surplus,date);
+            //条件扣减余额：零行表示并发变化，整体回滚（订单/流水一起回退）。
+            int balanceRows = userBalanceMapper.decreaseBalance(user.getId(), totalPrice, date);
+            if (balanceRows == 0) {
+                throw new SauException(500, "余额并发变化，本次下单未成功，请重试");
+            }
+
+            //流水 after 使用同事务权威数值。
+            BigDecimal afterBalance = userBalanceMapper.getBalanceValue(user.getId());
+            BigDecimal beforeBalance = afterBalance == null
+                    ? userBalance.getBalance()
+                    : afterBalance.add(totalPrice);
+            balanceRecord.setBeforeBalance(beforeBalance);
+            if (afterBalance == null) {
+                throw new SauException(500, "余额流水读取异常，本次下单未成功");
+            }
+            balanceRecord.setAfterBalance(afterBalance);
 
             Date dateTime;
             //更新库存
             for (Long cartId : cartIds){
                 cart = cartMapper.getByCartId(cartId);
                 beverage = beverageMapper.selectById(cart.getGoodsId());
-                //更新库存
+                //条件扣减库存：stock >= quantity 才扣；零行表示并发变化，整体回滚。
                 dateTime = new Date();
-                beverageMapper.updateStock(beverage.getId(),beverage.getStock() - cart.getQuantity(),dateTime);
+                int rows = beverageMapper.decreaseStock(beverage.getId(), cart.getQuantity(), dateTime);
+                if (rows == 0) {
+                    throw new SauException(500, "库存并发变化，本次下单未成功，请重试");
+                }
             }
 
         }else {

@@ -15,4 +15,13 @@ public interface AgentService {
      * @return 运行结果
      */
     AgentRunResult chat(Long userId, AgentChatDto agentChatDto);
+
+    /**
+     * 按确认标识查询商品确认回执与订单真实状态（只读，归属校验）。
+     *
+     * @param userId         可信用户ID
+     * @param confirmationId 业务确认标识
+     * @return 结果；不存在或非本人时为 null
+     */
+    com.sau.gym.model.vo.order.OrderConfirmationResult queryConfirmation(Long userId, String confirmationId);
 }

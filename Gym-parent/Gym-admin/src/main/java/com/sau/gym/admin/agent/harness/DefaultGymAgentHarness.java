@@ -625,6 +625,7 @@ public class DefaultGymAgentHarness implements GymAgentHarness {
                 result.getErrorCode(),
                 committed,
                 session.pendingHistory == null ? -1L : session.pendingHistory.getRevision(),
+                result.getBusinessId(),
                 session.writeTicket);
 
         trace("RUN_FINISH", "运行终态已记录",

@@ -3,6 +3,7 @@ package com.sau.gym.admin.mapper;
 import com.sau.gym.model.dto.shopping.BeverageDto;
 import com.sau.gym.model.entity.shopping.Beverage;
 import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
 
 import java.util.Date;
 import java.util.List;
@@ -27,6 +28,9 @@ public interface BeverageMapper {
 
     //更新库存
     void updateStock(Long id,Integer stock,Date date);
+
+    //条件扣减库存：stock >= quantity 才扣减，返回影响行数；零行表示本次扣减未成功
+    int decreaseStock(@Param("id") Long id, @Param("quantity") Integer quantity, @Param("date") Date date);
 
     //根据商品名查数据库商品信息
     Beverage selectByName(String productName);

@@ -41,6 +41,11 @@ public class AgentRunInfo implements Serializable {
     private Boolean sessionCommitted;
 
     /**
+     * 业务标识（如商品确认 confirmationId），用于关联查询办理结果。
+     */
+    private String businessId;
+
+    /**
      * 更新时间（epoch 毫秒）。
      */
     private Long updateTime;

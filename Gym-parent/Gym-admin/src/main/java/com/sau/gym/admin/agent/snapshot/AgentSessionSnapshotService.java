@@ -148,6 +148,7 @@ public class AgentSessionSnapshotService {
             runInfo.setStage(record.getStage());
             runInfo.setErrorCode(record.getErrorCode());
             runInfo.setSessionCommitted(record.getSessionCommitted());
+            runInfo.setBusinessId(record.getBusinessId());
             runInfo.setUpdateTime(record.getUpdateTime());
             snapshot.setRun(runInfo);
         }

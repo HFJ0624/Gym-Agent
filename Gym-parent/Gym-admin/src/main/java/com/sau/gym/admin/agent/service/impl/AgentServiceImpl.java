@@ -3,8 +3,10 @@ package com.sau.gym.admin.agent.service.impl;
 import com.sau.gym.admin.agent.harness.AgentHarnessRequest;
 import com.sau.gym.admin.agent.harness.GymAgentHarness;
 import com.sau.gym.admin.agent.runtime.AgentRunResult;
-import com.sau.gym.admin.agent.runtime.AgentRunStatus;
 import com.sau.gym.admin.agent.service.AgentService;
+import com.sau.gym.admin.service.OrderService;
+import com.sau.gym.admin.agent.runtime.AgentRunStatus;
+
 import com.sau.gym.admin.agent.service.AgentTraceService;
 import com.sau.gym.admin.agent.trace.AgentTraceContext;
 import com.sau.gym.admin.agent.trace.AgentTraceInfo;
@@ -37,6 +39,9 @@ public class AgentServiceImpl implements AgentService {
     private static final Logger log = LoggerFactory.getLogger(AgentServiceImpl.class);
 
     private final GymAgentHarness gymAgentHarness;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    private com.sau.gym.admin.service.OrderService orderService;
 
     private final ChatRecordMapper chatRecordMapper;
 
@@ -127,6 +132,19 @@ public class AgentServiceImpl implements AgentService {
         } finally {
             AgentTraceContext.clear();
             AgentUserContext.clear();
+        }
+    }
+
+    /**
+     * 按确认标识查询商品确认回执（只读委托）。
+     */
+    @Override
+    public com.sau.gym.model.vo.order.OrderConfirmationResult queryConfirmation(Long userId, String confirmationId) {
+        try {
+            return orderService.queryConfirmation(userId, confirmationId);
+        } catch (Exception e) {
+            log.warn("[AgentService] 回执查询失败: {}", e.getMessage());
+            return null;
         }
     }
 

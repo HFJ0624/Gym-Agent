@@ -86,8 +86,15 @@ public class AgentConfirmationWorkflow {
             }
 
             case "confirm_shopping" -> {
-                reply = requireLogin(userId, "请先登录后再确认下单。",
-                        () -> gymShoppingTools.confirmPendingShopping(userId, sessionId, token, ticket));
+                String finalReply = requireLogin(userId, "请先登录后再确认下单。",
+                        () -> {
+                            String text = gymShoppingTools.confirmPendingShopping(userId, sessionId, token, ticket);
+                            lastShoppingResult = gymShoppingTools.getLastConfirmationResult();
+                            return text;
+                        });
+
+                reply = finalReply;
+
                 recordLog("confirmPendingShopping", "用户确认商品下单草稿，执行真实下单业务",
                         message, reply, System.currentTimeMillis() - start);
             }
@@ -129,8 +136,45 @@ public class AgentConfirmationWorkflow {
                 System.currentTimeMillis() - start
         );
 
-        return AgentRunResult.completed(reply);
+        AgentRunResult runResult = AgentRunResult.completed(reply);
+
+        //按真实业务结果标注：办理失败不能被记成 SUCCESS，业务标识供恢复查询关联订单。
+        if (lastShoppingResult != null && "confirm_shopping".equals(command)) {
+            String status = lastShoppingResult.getStatus();
+
+            boolean businessOk =
+                    com.sau.gym.model.enums.order.OrderConfirmationStatus.PAID.name().equals(status)
+                            || com.sau.gym.model.enums.order.OrderConfirmationStatus.PENDING_PAYMENT.name().equals(status);
+
+            runResult.setBusinessFailure(!businessOk);
+            runResult.setErrorCode(businessOk ? null : status);
+            runResult.setBusinessId(lastShoppingResult.getConfirmationId());
+
+            //已成交回执卡片（只展示真实订单字段，历史成交与待确认草稿区分）。
+            if (businessOk && lastShoppingResult.getOrderId() != null) {
+                java.util.Map<String, Object> receipt = new java.util.LinkedHashMap<>();
+                receipt.put("type", "ORDER_RECEIPT");
+                java.util.Map<String, Object> receiptData = new java.util.LinkedHashMap<>();
+                receiptData.put("orderId", lastShoppingResult.getOrderId());
+                receiptData.put("orderNo", lastShoppingResult.getOrderNo());
+                receiptData.put("totalAmount", lastShoppingResult.getTotalAmount());
+                receiptData.put("payStatus", lastShoppingResult.getPayStatus());
+                receiptData.put("confirmationId", lastShoppingResult.getConfirmationId());
+                receiptData.put("replay", lastShoppingResult.isReplay());
+                receipt.put("data", receiptData);
+                runResult.getCards().add(receipt);
+            }
+
+            lastShoppingResult = null;
+        }
+
+        return runResult;
     }
+
+    /**
+     * 最近一次商品确认的结构化结果。
+     */
+    private com.sau.gym.model.vo.order.OrderConfirmationResult lastShoppingResult;
 
     /**
      * 处理“取消预约 12”，生成取消草稿并进入待确认状态。

@@ -115,6 +115,17 @@
         where id = #{id}
     </update>
 
+    <!-- 条件扣减库存：库存充足且商品有效才扣减，影响行数为 0 表示扣减失败 -->
+    <update id="decreaseStock">
+        update beverage
+        set stock = stock - #{quantity},
+        update_time = #{date}
+        where id = #{id}
+          and stock &gt;= #{quantity}
+          and status = 1
+          and is_deleted = 0
+    </update>
+
     <select id="selectByName" resultMap="beverageMap">
         select *
         from beverage
