@@ -119,46 +119,6 @@ public class RedisAgentSessionMessageStore implements AgentSessionMessageStore {
     }
 
     @Override
-    public boolean saveHistory(Long userId, String sessionId, SessionHistory history) {
-        if (history == null) {
-            return true;
-        }
-
-        try {
-            String key = buildKey(userId, sessionId);
-
-            List<SessionMessage> messages = history.getMessages() == null
-                    ? new ArrayList<>()
-                    : new ArrayList<>(history.getMessages());
-
-            while (messages.size() > MAX_MESSAGE_COUNT) {
-                messages.remove(0);
-            }
-
-            //裁剪后仍需保证 tool 消息能找到对应的 assistant tool_calls。
-            messages = dropOrphanToolMessages(messages);
-
-            SessionHistory snapshot = new SessionHistory();
-            snapshot.setSummary(history.getSummary());
-            snapshot.setSummaryVersion(history.getSummaryVersion());
-            snapshot.setRevision(history.getRevision());
-            snapshot.setMessages(messages);
-            snapshot.setDisplayTurns(history.getDisplayTurns() == null
-                    ? new ArrayList<>()
-                    : history.getDisplayTurns());
-
-            String json = objectMapper.writeValueAsString(snapshot);
-            stringRedisTemplate.opsForValue().set(key, json, TTL);
-
-            return true;
-        } catch (Exception e) {
-            //写入失败必须让上层知道，避免宣称会话状态已保存。
-            log.warn("[AgentSession] 写入会话历史失败, sessionId={}, reason={}", sessionId, e.getMessage());
-            return false;
-        }
-    }
-
-    @Override
     public SessionWriteResult saveHistoryIfHolder(Long userId, String sessionId, SessionHistory history,
                                                   SessionWriteTicket ticket) {
         if (history == null) {

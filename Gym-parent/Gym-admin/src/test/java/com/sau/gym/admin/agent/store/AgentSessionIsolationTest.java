@@ -94,21 +94,38 @@ class AgentSessionIsolationTest {
             return true;
         });
 
-        draftStore = new AgentDraftStore(draftRedisTemplate,
-                mock(com.sau.gym.admin.agent.store.SessionProtectedRedis.class));
+        //受保护写入桩：令牌校验在真实 Redis 集成用例中验证，这里固定放行。
+        com.sau.gym.admin.agent.store.SessionProtectedRedis protectedRedis =
+                mock(com.sau.gym.admin.agent.store.SessionProtectedRedis.class);
+        //受保护写入桩：把值写入与 loadHistory 相同的 stringStore，模拟真实 Lua SET。
+        when(protectedRedis.writeIfHolder(anyString(), anyString(), anyString(), anyString(), any(Duration.class)))
+                .thenAnswer(invocation -> {
+                    stringStore.put(invocation.getArgument(2), invocation.getArgument(3));
+                    return com.sau.gym.admin.agent.store.SessionWriteResult.SAVED;
+                });
+
+        messageStore = new RedisAgentSessionMessageStore(stringRedisTemplate, objectMapper, protectedRedis);
+
+        draftStore = new AgentDraftStore(draftRedisTemplate, protectedRedis);
     }
+
+    /**
+     * 测试用写入凭证。
+     */
+    private final com.sau.gym.admin.agent.store.SessionWriteTicket testTicket =
+            com.sau.gym.admin.agent.store.SessionWriteTicket.of("lock", "token");
 
     @Test
     void 同一用户不同会话的消息历史互不影响() {
-        messageStore.saveHistory(1L, "session-a", historyOf(
+        messageStore.saveHistoryIfHolder(1L, "session-a", historyOf(
                 SessionMessage.user("我是A会话"),
                 SessionMessage.assistant("A会话回复")
-        ));
+        ), testTicket);
 
-        messageStore.saveHistory(1L, "session-b", historyOf(
+        messageStore.saveHistoryIfHolder(1L, "session-b", historyOf(
                 SessionMessage.user("我是B会话"),
                 SessionMessage.assistant("B会话回复")
-        ));
+        ), testTicket);
 
         List<SessionMessage> sessionA = messageStore.loadHistory(1L, "session-a").getMessages();
         List<SessionMessage> sessionB = messageStore.loadHistory(1L, "session-b").getMessages();
@@ -122,8 +139,8 @@ class AgentSessionIsolationTest {
 
     @Test
     void 不同用户相同sessionId也不串数据() {
-        messageStore.saveHistory(1L, "shared", historyOf(SessionMessage.user("用户1")));
-        messageStore.saveHistory(2L, "shared", historyOf(SessionMessage.user("用户2")));
+        messageStore.saveHistoryIfHolder(1L, "shared", historyOf(SessionMessage.user("用户1")), testTicket);
+        messageStore.saveHistoryIfHolder(2L, "shared", historyOf(SessionMessage.user("用户2")), testTicket);
 
         assertEquals("用户1", messageStore.loadHistory(1L, "shared").getMessages().get(0).getContent());
         assertEquals("用户2", messageStore.loadHistory(2L, "shared").getMessages().get(0).getContent());
@@ -133,11 +150,11 @@ class AgentSessionIsolationTest {
     void 没有配对工具调用的历史应被丢弃() {
         SessionMessage orphanTool = SessionMessage.tool("call_missing", "query", "{}");
 
-        messageStore.saveHistory(1L, "session-a", historyOf(
+        messageStore.saveHistoryIfHolder(1L, "session-a", historyOf(
                 SessionMessage.user("你好"),
                 orphanTool,
                 SessionMessage.assistant("你好")
-        ));
+        ), testTicket);
 
         List<SessionMessage> messages = messageStore.loadHistory(1L, "session-a").getMessages();
 
@@ -155,7 +172,8 @@ class AgentSessionIsolationTest {
                 SessionMessage.assistant("已生成预约草稿")
         ));
 
-        assertTrue(messageStore.saveHistory(1L, "session-s", history));
+        assertEquals(com.sau.gym.admin.agent.store.SessionWriteResult.SAVED,
+                messageStore.saveHistoryIfHolder(1L, "session-s", history, testTicket));
 
         SessionHistory loaded = messageStore.loadHistory(1L, "session-s");
 

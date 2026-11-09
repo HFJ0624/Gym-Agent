@@ -553,15 +553,7 @@ const sendMessage = async text => {
 
     if (userId.value) {
       try {
-        const { data } = await axios.get(
-          `http://localhost:9601/front/agent/sessions/${sessionId.value}`,
-          {
-            headers: authStore.token ? { token: authStore.token } : {},
-            timeout: 15000
-          }
-        )
-
-        const payload = data && data.data ? data.data : null
+        const payload = await querySessionSnapshot()
         const run = payload && payload.run
 
         //本轮已完成或待确认：展示已保存结果，不重发请求。
@@ -1749,20 +1741,13 @@ function startPolling() {
     }
 
     try {
-      const { data } = await axios.get(
-        `http://localhost:9601/front/agent/sessions/${sessionId.value}`,
-        {
-          headers: authStore.token ? { token: authStore.token } : {},
-          timeout: 15000
-        }
-      )
+      const payload = await querySessionSnapshot()
 
       if (token !== restoreToken) {
         stopPolling()
         return
       }
 
-      const payload = data && data.data ? data.data : null
       const run = payload && payload.run
 
       if (!run || run.status !== 'RUNNING') {

@@ -99,7 +99,7 @@ class AgentHarnessCommitGuardTest {
                 AgentRunResult.completed("旧请求回复"));
 
         assertFalse(committed);
-        verify(messageStore, never()).saveHistory(any(), anyString(), any());
+        verify(messageStore, never()).saveHistoryIfHolder(any(), anyString(), any(), any());
     }
 
     @Test
@@ -114,6 +114,5 @@ class AgentHarnessCommitGuardTest {
 
         assertTrue(committed);
         verify(messageStore).saveHistoryIfHolder(1L, "session-a", session.pendingHistory, session.writeTicket);
-        verify(messageStore, never()).saveHistory(any(), anyString(), any());
     }
 }

@@ -349,7 +349,9 @@ public class ShoppingOrderTxService {
     }
 
     /**
-     * 服务端快照摘要（商品/数量/价格），用于回执对比。
+     * 服务端快照摘要（商品/数量/价格的 SHA-256 指纹）。
+     * 当前用途：随回执持久留存，用于事后诊断与人工比对确认时的商品/数量/价格；
+     * 不做运行时校验分支（价格一致性由 PRICE_CHANGED 分支基于真实价格判断）。
      */
     private String snapshotHash(ShoppingConfirmationCommand command) {
         String raw = command.getGoodsId() + "|" + command.getQuantity() + "|"

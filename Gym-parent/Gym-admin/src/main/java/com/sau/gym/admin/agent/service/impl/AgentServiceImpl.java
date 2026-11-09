@@ -11,7 +11,6 @@ import com.sau.gym.admin.agent.service.AgentTraceService;
 import com.sau.gym.admin.agent.trace.AgentTraceContext;
 import com.sau.gym.admin.agent.trace.AgentTraceInfo;
 import com.sau.gym.admin.agent.util.AgentSessionIdUtil;
-import com.sau.gym.admin.agent.util.AgentUserContext;
 import com.sau.gym.admin.mapper.ChatRecordMapper;
 import com.sau.gym.admin.mapper.UserMapper;
 import com.sau.gym.model.dto.agent.AgentChatDto;
@@ -74,7 +73,6 @@ public class AgentServiceImpl implements AgentService {
         long start = System.currentTimeMillis();
 
         AgentTraceContext.set(new AgentTraceInfo(runId, userId, message));
-        AgentUserContext.setUserId(userId);
 
         try {
             agentTraceService.startTrace(runId, userId, null, message);
@@ -131,7 +129,6 @@ public class AgentServiceImpl implements AgentService {
 
         } finally {
             AgentTraceContext.clear();
-            AgentUserContext.clear();
         }
     }
 

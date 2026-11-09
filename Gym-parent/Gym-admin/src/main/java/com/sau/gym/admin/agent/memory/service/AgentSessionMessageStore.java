@@ -27,17 +27,6 @@ public interface AgentSessionMessageStore {
     SessionHistory loadHistory(Long userId, String sessionId);
 
     /**
-     * 保存会话历史快照（无持有者保护）。
-     * 仅兼容保留，Agent 主链必须使用 saveHistoryIfHolder。
-     *
-     * @param userId   用户ID
-     * @param sessionId 会话ID
-     * @param history  会话历史快照
-     * @return 是否写入成功
-     */
-    boolean saveHistory(Long userId, String sessionId, SessionHistory history);
-
-    /**
      * 持有者保护的会话快照写入。
      * Redis 原子校验锁令牌后写入，锁丢失返回 LOCK_LOST，Redis 异常返回 STORE_UNAVAILABLE。
      *
