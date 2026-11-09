@@ -83,42 +83,17 @@ public class ShoppingOrderTxService {
     public OrderConfirmationResult confirm(ShoppingConfirmationCommand command) {
         Date now = new Date();
 
-        //1. 回执查询：已提交且归属匹配的回执直接重放真实结果。
+        //1. 回执查询：已提交且归属匹配的回执直接重放真实结果（零写入）。
         ShoppingConfirmation existing = confirmationMapper.selectByConfirmationId(command.getConfirmationId());
 
         if (existing != null) {
             return replay(command, existing);
         }
 
-        //2. 商品校验：存在、启用、数量合法、价格与确认快照一致。
-        Beverage beverage = beverageMapper.selectById(command.getGoodsId());
-
-        if (beverage == null || beverage.getStatus() == null || beverage.getStatus() != 1) {
-            return fail(command, OrderConfirmationStatus.BUSINESS_FAILED, "GOODS_UNAVAILABLE",
-                    "下单失败：商品不存在或已下架。本次未扣款、未扣库存。");
-        }
-
-        if (command.getQuantity() == null || command.getQuantity() <= 0) {
-            return fail(command, OrderConfirmationStatus.BUSINESS_FAILED, "INVALID_QUANTITY",
-                    "下单失败：商品数量不合法。");
-        }
-
-        if (beverage.getPrice().compareTo(command.getPriceSnapshot()) != 0) {
-            OrderConfirmationResult result = fail(command, OrderConfirmationStatus.PRICE_CHANGED, "PRICE_CHANGED",
-                    "商品价格已变化：确认时 " + command.getPriceSnapshot() + " 元/件，现价 "
-                            + beverage.getPrice() + " 元/件。已为你生成新价格的待确认草稿，请确认后再下单。");
-            result.setLatestSnapshot(buildLatestSnapshot(command, beverage));
-            return result;
-        }
-
-        //3. 条件扣库存：零行表示库存不足，本次没有任何业务写入。
-        if (beverageMapper.decreaseStock(command.getGoodsId(), command.getQuantity(), now) == 0) {
-            return fail(command, OrderConfirmationStatus.OUT_OF_STOCK, "OUT_OF_STOCK",
-                    "下单失败：库存不足（确认后库存发生变化）。本次未扣款。"
-                            + "你可以稍后重试，或修改数量后重新下单。");
-        }
-
-        //4. 声明回执（IN_PROGRESS）：唯一键冲突说明另一事务已提交，转为结果重放。
+        //2. 先通过回执主键唯一键占位，再执行任何库存/余额/订单写入：
+        //重复请求在扣库存之前就能被唯一键拦截，不会出现“先扣库存后撞回执”的窗口。
+        //占位发生唯一键冲突时抛 ConfirmationConflictSignal 让当前事务退出并回滚，
+        //由外层重新读取已提交回执做幂等重放；不允许在原事务内捕获冲突后直接返回成功。
         try {
             ShoppingConfirmation confirmation = new ShoppingConfirmation();
             confirmation.setConfirmationId(command.getConfirmationId());
@@ -130,17 +105,39 @@ public class ShoppingOrderTxService {
 
             confirmationMapper.insertOne(confirmation);
         } catch (DuplicateKeyException e) {
-            //同一业务意图已被并发确认：读取已提交回执并重放。
-            ShoppingConfirmation committed = confirmationMapper.selectByConfirmationId(command.getConfirmationId());
-
-            if (committed != null) {
-                return replay(command, committed);
-            }
-
-            throw new SauException(500, "确认标识冲突且回执暂时不可读，请稍后查询结果");
+            throw new ConfirmationConflictSignal();
         }
 
-        //5. 订单创建与支付处理（同一事务）。
+        //3. 商品校验：存在、启用、数量合法、价格与确认快照一致。
+        //占位后的明确失败同样抛 BusinessSignal 回滚占位，由外层映射回原有业务状态。
+        Beverage beverage = beverageMapper.selectById(command.getGoodsId());
+
+        if (beverage == null || beverage.getStatus() == null || beverage.getStatus() != 1) {
+            throw new BusinessSignal(fail(command, OrderConfirmationStatus.BUSINESS_FAILED, "GOODS_UNAVAILABLE",
+                    "下单失败：商品不存在或已下架。本次未扣款、未扣库存。"));
+        }
+
+        if (command.getQuantity() == null || command.getQuantity() <= 0) {
+            throw new BusinessSignal(fail(command, OrderConfirmationStatus.BUSINESS_FAILED, "INVALID_QUANTITY",
+                    "下单失败：商品数量不合法。"));
+        }
+
+        if (beverage.getPrice().compareTo(command.getPriceSnapshot()) != 0) {
+            OrderConfirmationResult changed = fail(command, OrderConfirmationStatus.PRICE_CHANGED, "PRICE_CHANGED",
+                    "商品价格已变化：确认时 " + command.getPriceSnapshot() + " 元/件，现价 "
+                            + beverage.getPrice() + " 元/件。已为你生成新价格的待确认草稿，请确认后再下单。");
+            changed.setLatestSnapshot(buildLatestSnapshot(command, beverage));
+            throw new BusinessSignal(changed);
+        }
+
+        //4. 条件扣库存：零行表示库存不足，占位与本次写入一起回滚。
+        if (beverageMapper.decreaseStock(command.getGoodsId(), command.getQuantity(), now) == 0) {
+            throw new BusinessSignal(fail(command, OrderConfirmationStatus.OUT_OF_STOCK, "OUT_OF_STOCK",
+                    "下单失败：库存不足（确认后库存发生变化）。本次未扣款。"
+                            + "你可以稍后重试，或修改数量后重新下单。"));
+        }
+
+        //5. 订单创建与支付处理（与占位回执同一事务）。
         BigDecimal total = beverage.getPrice().multiply(BigDecimal.valueOf(command.getQuantity()));
 
         Order order = new Order();
@@ -156,7 +153,7 @@ public class ShoppingOrderTxService {
         UserBalance userBalance = userBalanceMapper.GetBalanceById(command.getUserId());
 
         if (userBalance == null) {
-            //余额记录缺失：抛出使事务回滚（库存/回执声明一起回滚），结果明确。
+            //余额记录缺失：抛出使事务回滚（库存/回执占位一起回滚），结果明确。
             throw new SauException(500, "余额记录异常，本次下单未成功");
         }
 
@@ -260,6 +257,34 @@ public class ShoppingOrderTxService {
                 + "\n（余额不足，未完成支付；库存已按本单预留。）");
 
         return result;
+    }
+
+    /**
+     * 幂等占位冲突信号：同 confirmationId 的并发确认撞唯一键。
+     * 必须让当前事务退出回滚，由外层重新读取已提交回执，禁止在原事务内直接返回成功。
+     */
+    public static class ConfirmationConflictSignal extends RuntimeException {
+
+        public ConfirmationConflictSignal() {
+            super("confirmation id conflict");
+        }
+    }
+
+    /**
+     * 占位后的明确业务失败信号：携带结构化结果，事务回滚后由外层原样返回。
+     */
+    public static class BusinessSignal extends RuntimeException {
+
+        private final OrderConfirmationResult result;
+
+        public BusinessSignal(OrderConfirmationResult result) {
+            super(result == null ? "business failed" : result.getStatus());
+            this.result = result;
+        }
+
+        public OrderConfirmationResult getResult() {
+            return result;
+        }
     }
 
     /**

@@ -17,18 +17,19 @@ import com.sau.gym.model.enums.order.OrderConfirmationStatus;
 import com.sau.gym.model.vo.order.OrderConfirmationResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -36,11 +37,13 @@ import static org.mockito.Mockito.when;
 
 /**
  * 作者:hfj
- * 功能:商品确认交易核心单元测试（第四轮 P0）
+ * 功能:商品确认交易核心单元测试（幂等占位顺序版）
  * 说明:
- * 覆盖：库存竞争失败、回执重放、越权拒绝、价格变化、商品下架、
- * 余额条件扣款冲突与已支付主路径。并发/回滚的真实 MySQL 集成验证
- * 见 ShoppingConfirmationMySqlIT（环境受限时标注未执行）。
+ * 1. 回执占位必须先于库存/余额/订单写入（inOrder 校验），
+ *    重复请求在扣库存之前被唯一键拦截。
+ * 2. 占位后的明确失败（库存不足/价格变化/商品下架）抛 BusinessSignal，
+ *    由门面在事务回滚后映射回原有业务状态。
+ * 3. 并发/回滚的真实 MySQL 集成验证见 ShoppingConfirmationMySqlIT。
  */
 class ShoppingOrderTxServiceTest {
 
@@ -100,57 +103,86 @@ class ShoppingOrderTxServiceTest {
     }
 
     @Test
-    void 确认时库存已为0应返回OUT_OF_STOCK且无任何业务写入() {
+    void 占位必须先于库存扣减() {
         when(confirmationMapper.selectByConfirmationId("c1")).thenReturn(null);
+        when(confirmationMapper.insertOne(any(ShoppingConfirmation.class))).thenReturn(1);
+        when(beverageMapper.selectById(100L)).thenReturn(beverage());
+        when(beverageMapper.decreaseStock(eq(100L), eq(2), any())).thenReturn(1);
+
+        UserBalance balance = new UserBalance();
+        balance.setUserId(1L);
+        balance.setBalance(new BigDecimal("100.00"));
+        when(userBalanceMapper.GetBalanceById(1L)).thenReturn(balance);
+        when(userBalanceMapper.decreaseBalance(eq(1L), any(), any())).thenReturn(1);
+        when(userBalanceMapper.getBalanceValue(1L)).thenReturn(new BigDecimal("96.00"));
+
+        txService.confirm(command("c1"));
+
+        //回执占位先于条件扣库存：重复请求在扣库存前被唯一键拦截。
+        InOrder inOrder = inOrder(confirmationMapper, beverageMapper);
+        inOrder.verify(confirmationMapper).insertOne(any(ShoppingConfirmation.class));
+        inOrder.verify(beverageMapper).decreaseStock(eq(100L), eq(2), any());
+    }
+
+    @Test
+    void 确认时库存已为0应抛信号且不写订单() {
+        when(confirmationMapper.selectByConfirmationId("c1")).thenReturn(null);
+        when(confirmationMapper.insertOne(any(ShoppingConfirmation.class))).thenReturn(1);
         when(beverageMapper.selectById(100L)).thenReturn(beverage());
         when(beverageMapper.decreaseStock(eq(100L), eq(2), any())).thenReturn(0);
 
-        OrderConfirmationResult result = txService.confirm(command("c1"));
+        ShoppingOrderTxService.BusinessSignal signal = assertThrows(ShoppingOrderTxService.BusinessSignal.class,
+                () -> txService.confirm(command("c1")));
 
-        assertEquals(OrderConfirmationStatus.OUT_OF_STOCK.name(), result.getStatus());
-        assertTrue(result.getMessage().contains("库存不足"));
-        assertTrue(result.getMessage().contains("未扣款"));
+        assertEquals(OrderConfirmationStatus.OUT_OF_STOCK.name(), signal.getResult().getStatus());
+        assertTrue(signal.getResult().getMessage().contains("库存不足"));
+        assertTrue(signal.getResult().getMessage().contains("未扣款"));
 
-        //库存不足：无订单、无回执声明、无扣款流水。
+        //事务回滚语义：不写订单、不回填回执、不扣款。
         verify(orderMapper, never()).insertOrder(any());
-        verify(confirmationMapper, never()).insertOne(any());
+        verify(confirmationMapper, never()).updateResult(anyString(), any(), anyString(), anyString());
         verify(userBalanceMapper, never()).decreaseBalance(any(), any(), any());
     }
 
     @Test
-    void 商品下架应返回明确业务失败() {
+    void 商品下架应抛信号返回明确业务失败() {
         when(confirmationMapper.selectByConfirmationId("c1")).thenReturn(null);
+        when(confirmationMapper.insertOne(any(ShoppingConfirmation.class))).thenReturn(1);
 
         Beverage offShelf = beverage();
         offShelf.setStatus(0);
         when(beverageMapper.selectById(100L)).thenReturn(offShelf);
 
-        OrderConfirmationResult result = txService.confirm(command("c1"));
+        ShoppingOrderTxService.BusinessSignal signal = assertThrows(ShoppingOrderTxService.BusinessSignal.class,
+                () -> txService.confirm(command("c1")));
 
-        assertEquals(OrderConfirmationStatus.BUSINESS_FAILED.name(), result.getStatus());
-        assertEquals("GOODS_UNAVAILABLE", result.getErrorCode());
+        assertEquals(OrderConfirmationStatus.BUSINESS_FAILED.name(), signal.getResult().getStatus());
+        assertEquals("GOODS_UNAVAILABLE", signal.getResult().getErrorCode());
         verify(beverageMapper, never()).decreaseStock(any(), any(), any());
     }
 
     @Test
-    void 价格变化应返回PRICE_CHANGED并携带最新快照() {
+    void 价格变化应抛信号并携带最新快照() {
         when(confirmationMapper.selectByConfirmationId("c1")).thenReturn(null);
+        when(confirmationMapper.insertOne(any(ShoppingConfirmation.class))).thenReturn(1);
 
         Beverage changed = beverage();
         changed.setPrice(new BigDecimal("2.50"));
         when(beverageMapper.selectById(100L)).thenReturn(changed);
 
-        OrderConfirmationResult result = txService.confirm(command("c1"));
+        ShoppingOrderTxService.BusinessSignal signal = assertThrows(ShoppingOrderTxService.BusinessSignal.class,
+                () -> txService.confirm(command("c1")));
 
-        assertEquals(OrderConfirmationStatus.PRICE_CHANGED.name(), result.getStatus());
-        assertEquals(new BigDecimal("2.50"), result.getLatestSnapshot().get("price"));
+        assertEquals(OrderConfirmationStatus.PRICE_CHANGED.name(), signal.getResult().getStatus());
+        assertEquals(new BigDecimal("2.50"), signal.getResult().getLatestSnapshot().get("price"));
         verify(beverageMapper, never()).decreaseStock(any(), any(), any());
         verify(orderMapper, never()).insertOrder(any());
     }
 
     @Test
-    void 余额条件扣款零行应整体回滚且不插入订单() {
+    void 余额条件扣款零行应抛异常整体回滚且不写订单() {
         when(confirmationMapper.selectByConfirmationId("c1")).thenReturn(null);
+        when(confirmationMapper.insertOne(any(ShoppingConfirmation.class))).thenReturn(1);
         when(beverageMapper.selectById(100L)).thenReturn(beverage());
         when(beverageMapper.decreaseStock(eq(100L), eq(2), any())).thenReturn(1);
 
@@ -170,6 +202,7 @@ class ShoppingOrderTxServiceTest {
     @Test
     void 已支付主路径应写入订单与回执并发送通知() {
         when(confirmationMapper.selectByConfirmationId("c1")).thenReturn(null);
+        when(confirmationMapper.insertOne(any(ShoppingConfirmation.class))).thenReturn(1);
         when(beverageMapper.selectById(100L)).thenReturn(beverage());
         when(beverageMapper.decreaseStock(eq(100L), eq(2), any())).thenReturn(1);
 
@@ -180,10 +213,10 @@ class ShoppingOrderTxServiceTest {
         when(userBalanceMapper.decreaseBalance(eq(1L), any(), any())).thenReturn(1);
         when(userBalanceMapper.getBalanceValue(1L)).thenReturn(new BigDecimal("96.00"));
 
-        txService.confirm(command("c1"));
+        OrderConfirmationResult result = txService.confirm(command("c1"));
 
+        assertEquals(OrderConfirmationStatus.PAID.name(), result.getStatus());
         verify(orderMapper).insertOrder(any(Order.class));
-        verify(confirmationMapper).insertOne(any(ShoppingConfirmation.class));
         verify(confirmationMapper).updateResult(eq("c1"), any(), anyString(),
                 eq(OrderConfirmationStatus.PAID.name()));
         //publishEvent 有 Object/ApplicationEvent 两个重载，按实际调用重载核验。
@@ -215,10 +248,11 @@ class ShoppingOrderTxServiceTest {
         assertEquals("NO123", result.getOrderNo());
         assertTrue(result.getMessage().contains("未重复扣款"));
 
-        //重放不触发任何业务写入。
+        //重放不触发任何业务写入（含占位与扣库存）。
+        verify(confirmationMapper, never()).insertOne(any());
         verify(beverageMapper, never()).decreaseStock(any(), any(), any());
         verify(orderMapper, never()).insertOrder(any());
-        verify(eventPublisher, never()).publishEvent(any());
+        verify(eventPublisher, never()).publishEvent(any(Object.class));
     }
 
     @Test
@@ -234,7 +268,7 @@ class ShoppingOrderTxServiceTest {
         OrderConfirmationResult result = txService.confirm(command("c2"));
 
         assertEquals(OrderConfirmationStatus.BUSINESS_FAILED.name(), result.getStatus());
-        assertFalse(result.getMessage().contains("NO999"));
+        assertTrue(!result.getMessage().contains("NO999"));
         verify(orderMapper, never()).selectByOrderId(any());
     }
 }

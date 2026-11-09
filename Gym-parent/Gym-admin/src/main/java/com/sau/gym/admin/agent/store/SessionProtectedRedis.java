@@ -126,7 +126,7 @@ public class SessionProtectedRedis {
                     WRITE_SCRIPT,
                     RAW_ARG_SERIALIZER,
                     LONG_RESULT,
-                    List.of(dataKey),
+                    List.of(lockKey, dataKey),
                     token,
                     rawValue,
                     ttl.toMillis()
@@ -169,13 +169,12 @@ public class SessionProtectedRedis {
     public SessionWriteResult deleteIfHolder(RedisTemplate<String, ?> template,
                                              String lockKey,
                                              String token,
-                                             String dataKey) {
-        try {
+                                             String dataKey) {        try {
             Long result = template.execute(
                     DELETE_SCRIPT,
                     RAW_ARG_SERIALIZER,
                     LONG_RESULT,
-                    List.of(dataKey),
+                    List.of(lockKey, dataKey),
                     token
             );
 
@@ -190,5 +189,12 @@ public class SessionProtectedRedis {
             log.warn("[SessionProtected] 受保护删除异常, dataKey={}, reason={}", dataKey, e.getMessage());
             return SessionWriteResult.STORE_UNAVAILABLE;
         }
+    }
+
+    /**
+     * 持有者保护删除（字符串模板便捷重载）。
+     */
+    public SessionWriteResult deleteIfHolder(String lockKey, String token, String dataKey) {
+        return deleteIfHolder(stringRedisTemplate, lockKey, token, dataKey);
     }
 }

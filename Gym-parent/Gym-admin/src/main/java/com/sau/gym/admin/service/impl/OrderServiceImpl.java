@@ -87,6 +87,30 @@ public class OrderServiceImpl implements OrderService {
             com.sau.gym.model.dto.order.ShoppingConfirmationCommand command) {
         try {
             return shoppingOrderTxService.confirm(command);
+        } catch (ShoppingOrderTxService.ConfirmationConflictSignal e) {
+            //占位唯一键冲突：当前事务已回滚，重新读取已提交回执做幂等重放。
+            //重读失败不得编造成功，统一按结果待核实处理。
+            try {
+                ShoppingConfirmation committed =
+                        shoppingConfirmationMapper.selectByConfirmationId(command.getConfirmationId());
+
+                if (committed != null && command.getUserId().equals(committed.getUserId())) {
+                    return shoppingOrderTxService.buildReplayResult(command.getUserId(), committed);
+                }
+            } catch (Exception readError) {
+                // fall through to RESULT_UNKNOWN
+            }
+
+            com.sau.gym.model.vo.order.OrderConfirmationResult unknown =
+                    new com.sau.gym.model.vo.order.OrderConfirmationResult();
+            unknown.setStatus(com.sau.gym.model.enums.order.OrderConfirmationStatus.RESULT_UNKNOWN.name());
+            unknown.setErrorCode("CONFIRMATION_CONFLICT");
+            unknown.setConfirmationId(command.getConfirmationId());
+            unknown.setMessage("相同确认正在处理中，结果待核实。请稍后通过确认记录查询，不要盲目重复确认。");
+            return unknown;
+        } catch (ShoppingOrderTxService.BusinessSignal e) {
+            //占位后的明确业务失败：事务已回滚（占位与库存/余额/订单写入一起回退），原样返回业务状态。
+            return e.getResult();
         } catch (SauException e) {
             com.sau.gym.model.vo.order.OrderConfirmationResult result =
                     new com.sau.gym.model.vo.order.OrderConfirmationResult();
@@ -193,7 +217,21 @@ public class OrderServiceImpl implements OrderService {
             balanceRecord.setAmount(totalPrice);
             balanceRecord.setType(2);
             balanceRecord.setCreateTime(new Date());
-            balanceRecord.setRemark("用户下商城订单,订单金额:" + totalPrice + "元");
+            //条件扣减余额：零行表示并发变化，整体回滚（订单/流水一起回退）。
+            //先扣款并确认成功，再从同一事务读取扣款后的权威余额，
+            //填好变动前后余额后插入流水（两列为 NOT NULL，禁止先插后填）。
+            int balanceRows = userBalanceMapper.decreaseBalance(user.getId(), totalPrice, date);
+            if (balanceRows == 0) {
+                throw new SauException(500, "余额并发变化，本次下单未成功，请重试");
+            }
+
+            BigDecimal afterBalance = userBalanceMapper.getBalanceValue(user.getId());
+            if (afterBalance == null) {
+                throw new SauException(500, "余额流水读取异常，本次下单未成功");
+            }
+
+            balanceRecord.setBeforeBalance(afterBalance.add(totalPrice));
+            balanceRecord.setAfterBalance(afterBalance);
             balanceRecordMapper.insertOne(balanceRecord);
 
             //插入支付流水信息
@@ -208,23 +246,6 @@ public class OrderServiceImpl implements OrderService {
             paymentRecord.setOrderType(2);
             paymentRecord.setPayTime(date);
             paymentRecordMapper.insertOne(paymentRecord);
-
-            //条件扣减余额：零行表示并发变化，整体回滚（订单/流水一起回退）。
-            int balanceRows = userBalanceMapper.decreaseBalance(user.getId(), totalPrice, date);
-            if (balanceRows == 0) {
-                throw new SauException(500, "余额并发变化，本次下单未成功，请重试");
-            }
-
-            //流水 after 使用同事务权威数值。
-            BigDecimal afterBalance = userBalanceMapper.getBalanceValue(user.getId());
-            BigDecimal beforeBalance = afterBalance == null
-                    ? userBalance.getBalance()
-                    : afterBalance.add(totalPrice);
-            balanceRecord.setBeforeBalance(beforeBalance);
-            if (afterBalance == null) {
-                throw new SauException(500, "余额流水读取异常，本次下单未成功");
-            }
-            balanceRecord.setAfterBalance(afterBalance);
 
             Date dateTime;
             //更新库存

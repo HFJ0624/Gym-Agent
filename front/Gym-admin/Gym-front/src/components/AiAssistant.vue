@@ -1551,8 +1551,27 @@ function buildWelcomeMessage() {
 }
 
 /**
+ * 会话状态查询（统一请求函数）。
+ * 刷新恢复、断连核实、运行轮询共用；只读接口，模型调用次数为 0。
+ * 身份校验：携带当前登录 token，不采信前端传入的 userId；
+ * 各调用方自行保留竞态令牌、轮询次数上限与异常处理。
+ *
+ * @returns 快照数据；无会话时结构内 turns/cards 为空
+ */
+async function querySessionSnapshot() {
+  const { data } = await axios.get(
+    `http://localhost:9601/front/agent/sessions/${sessionId.value}`,
+    {
+      headers: authStore.token ? { token: authStore.token } : {},
+      timeout: 15000
+    }
+  )
+
+  return data && data.data ? data.data : null
+}
+
+/**
  * 会话恢复：拉取最近展示对话、运行状态与当前有效草稿。
- * 只读接口，模型调用次数为 0。
  */
 async function restoreSession(reason) {
   if (!userId.value) {
@@ -1562,20 +1581,12 @@ async function restoreSession(reason) {
   const token = ++restoreToken
 
   try {
-    const { data } = await axios.get(
-      `http://localhost:9601/front/agent/sessions/${sessionId.value}`,
-      {
-        headers: authStore.token ? { token: authStore.token } : {},
-        timeout: 15000
-      }
-    )
+    const payload = await querySessionSnapshot()
 
     //异步竞态：响应返回时身份或会话已变化则丢弃。
     if (token !== restoreToken || !userId.value) {
       return
     }
-
-    const payload = data && data.data ? data.data : null
 
     if (!payload) {
       return
